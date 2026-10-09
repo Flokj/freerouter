@@ -76,7 +76,10 @@ export interface CatalogCacheData {
  etag?: string;
 }
 
-// ── Extension API & UI Types (compatible with @earendil-works/pi-coding-agent) ──
+// ── Status surface ──
+// The proxy reports relay/gate transitions through an optional sink. In the
+// standalone server no host UI is wired, so this stays null and every notify
+// is a no-op; the interface keeps those call sites typed and swappable.
 
 export interface ExtensionUIContext {
  notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -84,79 +87,4 @@ export interface ExtensionUIContext {
  input(prompt: string, placeholder?: string): Promise<string | undefined>;
  select(prompt: string, options: string[]): Promise<string | undefined>;
  confirm?(title: string, message?: string): Promise<boolean>;
- /** Optional status-bar click handler (when host supports clickable widgets) */
- onStatusClick?(handler: () => void | Promise<void>): void | (() => void);
- /** Fallback/alternate names hosts may expose */
- onStatusBarClick?(handler: () => void | Promise<void>): void | (() => void);
- onWidgetClick?(handler: () => void | Promise<void>): void | (() => void);
-}
-
-export interface ExtensionContext {
- ui: ExtensionUIContext;
- [key: string]: unknown;
-}
-
-export interface CommandCompletion {
- value: string;
- label?: string;
- description?: string;
-}
-
-export interface RegisteredCommand {
- description?: string;
- getArgumentCompletions?: (prefix: string) => CommandCompletion[];
- handler: (args: string, ctx: ExtensionContext) => Promise<void> | void;
-}
-
-export interface ProviderModelCost {
- input: number;
- output: number;
- cacheRead: number;
- cacheWrite: number;
-}
-
-export interface ProviderModelCompat {
- supportsDeveloperRole?: boolean;
- supportsReasoningEffort?: boolean;
- thinkingFormat?: "openrouter" | string;
- sessionAffinityFormat?: "openai-nosession" | string;
- [key: string]: unknown;
-}
-
-export interface ProviderModelConfig {
- id: string;
- name: string;
- api?: ProviderApi;
- owned_by?: string;
- reasoning?: boolean;
- thinking?: {
-  mode: string;
-  efforts?: string[];
-  [key: string]: unknown;
- };
- thinkingLevelMap?: ThinkingLevelMap;
- input?: ModelInputType[];
- contextWindow?: number;
- maxTokens?: number;
- cost?: ProviderModelCost;
- compat?: ProviderModelCompat;
-}
-
-export interface ProviderConfig {
- baseUrl: string;
- apiKey: string;
- api: ProviderApi;
- compat?: {
-  supportsDeveloperRole?: boolean;
-  [key: string]: unknown;
- };
- models: ProviderModelConfig[];
-}
-
-export interface ExtensionAPI {
- registerProvider(name: string, config: ProviderConfig): void;
- registerCommand(name: string, spec: RegisteredCommand): void;
- on?(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void): void;
- sendUserMessage?(message: string, options?: { deliverAs?: string }): void;
- [key: string]: unknown;
 }

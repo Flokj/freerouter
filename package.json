@@ -2,56 +2,34 @@
   "name": "freeflow-proxy",
   "type": "module",
   "version": "1.0.0",
-  "description": "Standalone OpenAI proxy for Jin & coding agents with OpenCode Zen & KiloCode free models",
+  "description": "Local OpenAI-compatible proxy exposing free OpenCode Zen, KiloCode and Cline models to any coding agent",
   "main": "server.ts",
   "keywords": [
-    "pi-package",
-    "pi-extension",
-    "oh-my-pi",
-    "omp",
+    "openai",
+    "openai-compatible",
+    "proxy",
+    "llm",
     "free-models",
     "opencode",
     "kilocode",
-    "ai-models",
-    "relay"
+    "cline",
+    "coding-agent",
+    "local"
   ],
   "author": "trefeon",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/trefeon/pi-freeflow.git"
-  },
-  "homepage": "https://github.com/trefeon/pi-freeflow#readme",
   "engines": {
     "node": ">=22.19.0"
   },
-  "omp": {
-    "extensions": [
-      "./extensions"
-    ]
-  },
-  "pi": {
-    "extensions": [
-      "./extensions"
-    ]
-  },
-  "files": [
-    "extensions",
-    "src",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE"
-  ],
   "scripts": {
     "start": "node --experimental-strip-types server.ts",
     "test": "node --experimental-strip-types --import ./test/setup.mjs --test --test-concurrency=1 test/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.27.0",
     "@types/node": "^22.13.9",
-    "typescript": "^5.8.2",
-    "vitepress": "^1.6.4"
+    "typescript": "^5.8.2"
   },
   "dependencies": {
     "undici": "7.30.0"
