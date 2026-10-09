@@ -1014,6 +1014,10 @@ export function startProxy(
     parsedBody = JSON.parse(bodyStr);
     if (typeof parsedBody?.model === "string") {
      const canonical = resolveCanonicalModelId(parsedBody.model);
+     // Upstreams know only their own ids: an alias forwarded verbatim is read
+     // as an unknown paid model (Kilo answers PAID_MODEL_AUTH_REQUIRED). Pin the
+     // canonical id so the catalog alias actually reaches the right model.
+     if (canonical !== parsedBody.model) parsedBody.model = canonical;
      if (isClineModel(canonical)) {
       isCline = true;
      } else if (KILO_MODEL_IDS.has(canonical)) {
