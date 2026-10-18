@@ -488,6 +488,56 @@ export async function relayFetch(
 				);
 				continue;
 			}
+
+			// Relay-host rejection: 401 = a deployed worker whose RELAY_AUTH no
+			// longer matches this entry's x-relay-auth answers
+			// 401 {"error":"unauthorized"} before forwarding (deploy.ts). 403 =
+			// the relay's egress transformed the request fingerprint (e.g. a
+			// stripped User-Agent), so the worker's target guard or the upstream
+			// free-tier check rejected it — the relay never produced a genuine
+			// upstream verdict either. Both are relay-host faults: mark and roll
+			// like every other relay failure. Left to fall through, the broken
+			// relay reached markRelaySuccess below — recorded healthy/sticky,
+			// EWMA reset, no roll, so it kept serving the pool until something
+			// else noticed. A 403 is no longer treated as a terminal upstream
+			// verdict: rolls are bounded by pool size, and the gate state machine
+			// only primes on a 403 the direct path produced (proxy.ts). Non-401/403
+			// client errors keep their non-penalizing terminal path below.
+			if (res.status === 401 || res.status === 403) {
+				const authRejected = res.status === 401;
+				markRelayFailure(
+					targetUrl,
+					res.status,
+					authRejected
+						? "Relay auth rejected (x-relay-auth mismatch)"
+						: "Relay returned HTTP 403 (stripped or blocked egress fingerprint)",
+				);
+				lastResponse?.body?.cancel().catch(() => {});
+				lastResponse = res;
+				lastResponseRelay = targetUrl;
+				log(
+					"warn",
+					authRejected
+						? `relay ${targetUrl} rejected the relay auth in ${elapsed}s — rolling to next relay`
+						: `relay ${targetUrl} returned HTTP 403 (blocked egress fingerprint) in ${elapsed}s — rolling to next relay`,
+					{ upstream: url, status: res.status },
+					rid,
+				);
+				const now = Date.now();
+				if (now - lastRollNotify > ROLL_NOTIFY_MS) {
+					lastRollNotify = now;
+					const ui = getStatusUi();
+					if (ui?.notify) {
+						ui.notify(
+							authRejected
+								? `relay ${shortRelayLabel(targetUrl)} rejected the relay auth (HTTP 401) — rolled to next relay`
+								: `relay ${shortRelayLabel(targetUrl)} failed (HTTP 403) — rolled to next relay`,
+							"warning",
+						);
+					}
+				}
+				continue;
+			}
 			markRelaySuccess(targetUrl, Date.now() - attemptStart);
 
 			// SUCCESS or non-retriable client error (e.g. 200, 404):

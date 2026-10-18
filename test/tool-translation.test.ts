@@ -1,134 +1,1047 @@
+import test from "node:test";
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
-
 import {
+	convertSseToJson,
+	enforceOpencodeFingerprint,
+	ensureMessagesFingerprintTools,
+	sseToChatCompletionJson,
+	sseToMessagesJson,
+	sseToResponsesJson,
+	toolNameOf,
+} from "../src/opencode-fingerprint.ts";
+import {
+	ALL_HOST_TOOL_NAMES,
+	COMPAT_FINGERPRINT_SCHEMAS,
+	COMPAT_TOOL_DESCRIPTION,
+	OMP_CUSTOM_TOOL_NAMES,
+	OMP_HIDDEN_TOOL_NAMES,
+	OMP_TOOL_NAMES,
+	OPENCODE_FINGERPRINT_TOOLS,
+	PI_TOOL_NAMES,
 	apiForPathname,
+	buildFindGlobRestore,
 	canonicalizeTool,
-	isFindToolName,
-	isOmpLikeCaller,
+	chatBodyFromResponsesBody,
+	chatResponsesJsonFromChatCompletion,
+	chatResponsesSseFromChatCompletion,
+	restoreToolNameForCaller,
+	retargetToolChoiceForUpstream,
+	sanitizeUpstreamToolName,
 	toAnthropicTool,
 	toChatTool,
 	toResponsesTool,
+	translateToolsForPath,
 	upstreamToolNameFor,
 } from "../src/tool-translation.ts";
+import { withFingerprintTools } from "./_fingerprint.ts";
 
-describe("canonicalizeTool", () => {
-	it("reads a chat-shaped function tool", () => {
-		const c = canonicalizeTool({
-			type: "function",
-			function: { name: " read ", description: "Read a file", parameters: { type: "object", properties: { p: { type: "string" } } } },
-		});
-		assert.equal(c?.name, "read");
-		assert.equal(c?.description, "Read a file");
-		assert.equal(c?.parameters.type, "object");
+const PATHS = ["/v1/chat/completions", "/v1/responses", "/v1/messages"] as const;
+test("translateToolsForPath: MCP, custom, and device tools translate like built-ins", () => {
+	const mixed = [
+		{ type: "function", function: { name: "mcp__github__search_code", description: "mcp", parameters: { type: "object" } } },
+		{ type: "function", name: "my_custom_tool", description: "custom", parameters: { type: "object" } },
+		{ name: "xdev_tool", description: "xdev", input_schema: { type: "object" } },
+	];
+	for (const path of PATHS) {
+		const out = translateToolsForPath(mixed, path);
+		assert.equal(out.length, 3, `${path}: nothing dropped`);
+		const names = out.map((t) =>
+			typeof t.name === "string" ? t.name : ((t.function as Record<string, unknown>).name as string),
+		);
+		assert.ok(names.includes("mcp__github__search_code"));
+		assert.ok(names.includes("my_custom_tool"));
+		assert.ok(names.includes("xdev_tool"));
+	}
+	const asMessages = translateToolsForPath(mixed, "/v1/messages");
+	assert.ok(asMessages.every((t) => "input_schema" in t), "all three land in anthropic shape");
+});
+test("translateToolsForPath: same-shape tools pass through verbatim, strict survives conversion", () => {
+	const strictChat = {
+		type: "function",
+		function: { name: "mcp__db__query", description: "q", parameters: { type: "object" } },
+		strict: true,
+	};
+	const [verbatim] = translateToolsForPath([strictChat], "/v1/chat/completions");
+	assert.equal(verbatim, strictChat, "identical reference, every field intact");
+
+	const [converted] = translateToolsForPath([strictChat], "/v1/messages");
+	assert.equal(converted.name, "mcp__db__query");
+	assert.ok("input_schema" in converted);
+	assert.equal(converted.strict, true, "strict rides along cross-shape");
+
+	const strictResponses = { type: "function", name: "web_tool", description: "w", parameters: { type: "object" }, strict: false };
+	const [kept] = translateToolsForPath([strictResponses], "/v1/responses");
+	assert.equal(kept, strictResponses);
+});
+
+test("inventories: Pi exposes 8 tools, OMP's built-ins plus hidden, both hosts list find", () => {
+	assert.equal(PI_TOOL_NAMES.length, 8);
+	assert.equal(OMP_HIDDEN_TOOL_NAMES.length, 3);
+	// OMP's inventory tracks BUILTIN_TOOL_NAMES in the reference checkout plus
+	// browser/computer/hub, so assert membership of the names that decide
+	// behaviour rather than a count that drifts with every host release.
+	for (const builtIn of ["ida", "context_notes", "new_context", "wait", "find", "glob"]) {
+		assert.ok((OMP_TOOL_NAMES as readonly string[]).includes(builtIn), `OMP built-in ${builtIn}`);
+	}
+	// `find` is Pi's file finder and OMP's semantic search: same name, different
+	// tools, so the translator must keep both.
+	assert.ok((PI_TOOL_NAMES as readonly string[]).includes("find"));
+	assert.ok((OMP_TOOL_NAMES as readonly string[]).includes("find"));
+	assert.ok(!(PI_TOOL_NAMES as readonly string[]).includes("glob"), "Pi has no glob tool");
+	assert.deepEqual([...OMP_CUSTOM_TOOL_NAMES], ["generate_image", "tts"]);
+	assert.deepEqual([...OPENCODE_FINGERPRINT_TOOLS], ["bash", "glob", "grep", "read", "edit", "write"]);
+	for (const shared of ["read", "bash", "edit", "write", "grep"]) {
+		assert.ok((PI_TOOL_NAMES as readonly string[]).includes(shared));
+		assert.ok((OMP_TOOL_NAMES as readonly string[]).includes(shared));
+	}
+	// Pi-only file tools: find is renamed to glob upstream (restore map brings
+	// it back); ls/powershell pass through verbatim and are never dropped.
+	for (const piOnly of ["powershell", "find", "ls"]) {
+		assert.ok((PI_TOOL_NAMES as readonly string[]).includes(piOnly));
+	}
+	// OMP-only tools the proxy must never drop
+	for (const ompOnly of ["ast_grep", "lsp", "todo", "task", "web_search", "security_scan", "browser", "computer"]) {
+		assert.ok((OMP_TOOL_NAMES as readonly string[]).includes(ompOnly));
+		assert.ok(ALL_HOST_TOOL_NAMES.has(ompOnly));
+	}
+	// Settings-gated custom tools: not built-ins, but model-callable when enabled
+	for (const custom of [...OMP_CUSTOM_TOOL_NAMES]) {
+		assert.ok(!(OMP_TOOL_NAMES as readonly string[]).includes(custom), `${custom} is not a built-in`);
+		assert.ok(ALL_HOST_TOOL_NAMES.has(custom), `${custom} rides the host inventory`);
+	}
+});
+
+test("apiForPathname: routes all three proxy paths", () => {
+	assert.equal(apiForPathname("/v1/chat/completions"), "chat");
+	assert.equal(apiForPathname("/v1/responses"), "responses");
+	assert.equal(apiForPathname("/v1/messages"), "messages");
+});
+
+test("canonicalizeTool: reads chat, responses, and anthropic shapes", () => {
+	const chat = canonicalizeTool({
+		type: "function",
+		function: { name: "read", description: "r", parameters: { type: "object" } },
+	});
+	assert.deepEqual(chat, { name: "read", description: "r", parameters: { type: "object" } });
+
+	const responses = canonicalizeTool({
+		type: "function",
+		name: "grep",
+		description: "g",
+		parameters: { type: "object" },
+	});
+	assert.deepEqual(responses, { name: "grep", description: "g", parameters: { type: "object" } });
+
+	const anthropic = canonicalizeTool({
+		name: "edit",
+		description: "e",
+		input_schema: { type: "object", properties: { path: { type: "string" } } },
+	});
+	assert.deepEqual(anthropic, {
+		name: "edit",
+		description: "e",
+		parameters: { type: "object", properties: { path: { type: "string" } } },
 	});
 
-	it("reads a responses-shaped flat tool", () => {
-		const c = canonicalizeTool({ type: "function", name: "edit", description: "d", parameters: { type: "object", properties: {} } });
-		assert.equal(c?.name, "edit");
-		assert.equal(c?.description, "d");
-	});
+	// Non-function tools are not canonicalized (caller keeps them verbatim)
+	assert.equal(canonicalizeTool({ type: "web_search", name: "ws" }), null);
+	assert.equal(canonicalizeTool(null), null);
+	assert.equal(canonicalizeTool({}), null);
+});
 
-	it("reads an anthropic-shaped tool", () => {
-		const c = canonicalizeTool({ name: "bash", description: "d", input_schema: { type: "object", properties: {} } });
-		assert.equal(c?.name, "bash");
+test("converters: same canonical tool emits all three wire shapes", () => {
+	const canon = { name: "todo", description: "plan", parameters: { type: "object", properties: {} } };
+	assert.deepEqual(toChatTool(canon), {
+		type: "function",
+		function: { name: "todo", description: "plan", parameters: canon.parameters },
 	});
-
-	it("returns null for a non-function tool so it rides verbatim", () => {
-		assert.equal(canonicalizeTool({ type: "web_search" }), null);
-		assert.equal(canonicalizeTool(null), null);
-		assert.equal(canonicalizeTool("read"), null);
-		assert.equal(canonicalizeTool([{ name: "read" }]), null);
+	assert.deepEqual(toResponsesTool(canon), {
+		type: "function",
+		name: "todo",
+		description: "plan",
+		parameters: canon.parameters,
 	});
-
-	it("returns null when no name is present", () => {
-		assert.equal(canonicalizeTool({ type: "function", description: "d" }), null);
-		assert.equal(canonicalizeTool({ type: "function", function: { description: "d" } }), null);
-	});
-
-	it("carries strict only when it is a top-level boolean", () => {
-		assert.equal(canonicalizeTool({ name: "a", strict: true })?.strict, true);
-		assert.equal(canonicalizeTool({ name: "a", strict: "yes" })?.strict, undefined);
-	});
-
-	it("defaults parameters to an empty object schema", () => {
-		assert.deepEqual(canonicalizeTool({ name: "a" })?.parameters, { type: "object", properties: {} });
+	assert.deepEqual(toAnthropicTool(canon), {
+		name: "todo",
+		description: "plan",
+		input_schema: canon.parameters,
 	});
 });
 
-describe("tool shape conversion", () => {
-	const canon = canonicalizeTool({ name: "read", description: "d", parameters: { type: "object", properties: {} }, strict: true });
+function sampleTools(style: "chat" | "responses" | "anthropic", names: readonly string[]) {
+	return names.map((name) =>
+		style === "chat"
+			? { type: "function", function: { name, description: `${name} tool`, parameters: { type: "object" } } }
+			: style === "responses"
+				? { type: "function", name, description: `${name} tool`, parameters: { type: "object" } }
+				: { name, description: `${name} tool`, input_schema: { type: "object" } },
+	);
+}
 
-	it("emits chat shape with a function wrapper", () => {
-		const t = toChatTool(canon!);
-		assert.equal(t.type, "function");
-		assert.equal((t.function as Record<string, unknown>).name, "read");
-		assert.equal(t.strict, true);
-	});
-
-	it("emits responses shape flat", () => {
-		const t = toResponsesTool(canon!);
-		assert.equal(t.name, "read");
-		assert.equal(t.strict, true);
-		assert.ok(!("function" in t));
-	});
-
-	it("emits anthropic shape with input_schema", () => {
-		const t = toAnthropicTool(canon!);
-		assert.equal(t.name, "read");
-		assert.ok(t.input_schema);
-		assert.equal(t.type, undefined);
-	});
-
-	it("omits strict when the caller did not set it", () => {
-		const plain = canonicalizeTool({ name: "read", description: "d", parameters: { type: "object", properties: {} } })!;
-		for (const out of [toChatTool(plain), toResponsesTool(plain), toAnthropicTool(plain)]) {
-			assert.equal(out.strict, undefined);
+test("translateToolsForPath: full OMP inventory survives on all three APIs", () => {
+	for (const style of ["chat", "responses", "anthropic"] as const) {
+		for (const path of PATHS) {
+			const out = translateToolsForPath(sampleTools(style, OMP_TOOL_NAMES), path);
+			assert.equal(out.length, OMP_TOOL_NAMES.length, `${style} -> ${path}: no tool dropped`);
+			const names = out.map((t) =>
+				typeof t.name === "string"
+					? t.name
+					: ((t.function as Record<string, unknown>).name as string),
+			);
+			for (const name of OMP_TOOL_NAMES) assert.ok(names.includes(name), `${style} -> ${path}: keeps ${name}`);
+			// Target shape check
+			if (path.endsWith("/messages")) {
+				for (const t of out) assert.ok("input_schema" in t, "messages shape uses input_schema");
+			} else if (path.endsWith("/responses")) {
+				for (const t of out) assert.equal(t.type, "function");
+			} else {
+				for (const t of out) assert.ok("function" in t, "chat shape wraps in function");
+			}
 		}
-	});
+	}
 });
 
-describe("apiForPathname", () => {
-	it("maps responses, messages and chat paths", () => {
-		assert.equal(apiForPathname("/v1/responses"), "responses");
-		assert.equal(apiForPathname("/v1/messages"), "messages");
-		assert.equal(apiForPathname("/v1/chat/completions"), "chat");
-		assert.equal(apiForPathname("/anything/else"), "chat");
-	});
+test("translateToolsForPath: full Pi inventory survives on all three APIs", () => {
+	for (const path of PATHS) {
+		const out = translateToolsForPath(sampleTools("anthropic", PI_TOOL_NAMES), path);
+		assert.equal(out.length, PI_TOOL_NAMES.length, `pi -> ${path}: no tool dropped`);
+	}
 });
 
-describe("find to glob rename", () => {
-	it("treats find (any case) as the renamed tool", () => {
-		assert.equal(isFindToolName("find"), true);
-		assert.equal(isFindToolName("FIND"), true);
-		assert.equal(isFindToolName(" Find "), true);
-	});
-
-	it("leaves every other name alone", () => {
-		assert.equal(isFindToolName("glob"), false);
-		assert.equal(isFindToolName("grep"), false);
-	});
-
-	it("maps find to glob upstream and trims", () => {
-		assert.equal(upstreamToolNameFor("find"), "glob");
-		assert.equal(upstreamToolNameFor(" FIND "), "glob");
-		assert.equal(upstreamToolNameFor(" read "), "read");
-	});
+test("translateToolsForPath: non-function tools pass through verbatim, duplicates collapse", () => {
+	const out = translateToolsForPath(
+		[
+			{ type: "web_search", query: "x" },
+			{ type: "function", name: "read", description: "r" },
+			{ type: "function", function: { name: "read", description: "dup" } },
+		],
+		"/v1/messages",
+	);
+	assert.equal(out.length, 2);
+	assert.deepEqual(out[0], { type: "web_search", query: "x" });
+	assert.equal(out[1].name, "read");
 });
 
-describe("isOmpLikeCaller", () => {
-	it("detects explicit caller markers", () => {
-		for (const marker of ["ask", "task", "todo", "hub", "lsp"]) {
-			assert.equal(isOmpLikeCaller(["read", marker]), true, marker);
+test("fingerprint injection: completes the placeholder set in every target shape", () => {
+	const chat = withFingerprintTools([], "/v1/chat/completions");
+	assert.equal(chat.length, 6);
+	assert.ok(chat.every((t) => "function" in t));
+	const responses = withFingerprintTools([], "/v1/responses");
+	assert.equal(responses.length, 6);
+	assert.ok(responses.every((t) => t.type === "function" && typeof t.name === "string"));
+	const messages = withFingerprintTools([], "/v1/messages");
+	assert.equal(messages.length, 6);
+	assert.ok(messages.every((t) => "input_schema" in t && !("function" in t)));
+});
+
+test("ensureMessagesFingerprintTools: OMP caller gets real defs, Pi caller keeps placeholders", () => {
+	const ompBody: Record<string, unknown> = { tools: [{ name: "todo", description: "t" }] };
+	ensureMessagesFingerprintTools(ompBody);
+	const ompTools = ompBody.tools as Array<Record<string, unknown>>;
+	assert.equal(ompTools.length, 7);
+	const bash = ompTools.find((t) => t.name === "bash");
+	assert.ok(bash);
+	assert.ok(!(bash.description as string).includes("never be invoked"), "OMP bash is executable, not a placeholder");
+	const schema = bash.input_schema as { type?: unknown; properties?: Record<string, unknown> };
+	assert.equal(schema.type, "object");
+	assert.ok(Object.keys(schema.properties ?? {}).length > 0, "OMP bash carries a real params schema");
+	const piBody: Record<string, unknown> = { tools: [{ name: "find", description: "f" }] };
+	ensureMessagesFingerprintTools(piBody, false);
+	const piTools = piBody.tools as Array<Record<string, unknown>>;
+	const piBash = piTools.find((t) => t.name === "bash");
+	assert.ok(piBash);
+	assert.ok((piBash.description as string).includes("never be invoked"), "Pi keeps the empty placeholder");
+	assert.deepEqual(piBash.input_schema, COMPAT_FINGERPRINT_SCHEMAS.bash);
+});
+
+test("enforceOpencodeFingerprint: messages path translates caller tools and injects placeholder set", () => {
+	const body: Record<string, unknown> = {
+		model: "union-alpha",
+		stream: false,
+		// OMP host sends chat-shaped tools even for a messages-path model
+		tools: [{ type: "function", function: { name: "todo", description: "plan" } }],
+	};
+	const r = enforceOpencodeFingerprint(body, "/v1/messages");
+	assert.equal(r.clientRequestedStream, false);
+	assert.equal(r.callerHadTools, true);
+	assert.equal(body.stream, true);
+	const tools = body.tools as Array<Record<string, unknown>>;
+	const names = tools.map((t) => t.name as string);
+	assert.ok(names.includes("todo"), "caller tool kept");
+	for (const q of ["bash", "glob", "grep", "read", "edit", "write"]) assert.ok(names.includes(q), `placeholder set has ${q}`);
+	assert.ok(tools.every((t) => "input_schema" in t), "all tools in anthropic shape");
+});
+test("enforceOpencodeFingerprint: Pi find renamed to glob, ls kept verbatim on chat path", () => {
+	const body: Record<string, unknown> = {
+		model: "big-pickle",
+		stream: false,
+		tools: [
+			{ type: "function", function: { name: "find", description: "f", parameters: { type: "object", properties: { pattern: { type: "string" } } } } },
+			{ type: "function", function: { name: "ls", description: "l" } },
+		],
+	};
+	enforceOpencodeFingerprint(body, "/v1/chat/completions");
+	const tools = body.tools as Array<{ function: { name: string; description: string; parameters?: unknown } }>;
+	const names = tools.map((t) => t.function.name);
+	assert.ok(!names.includes("find"), "Pi find renamed upstream, never sent as find");
+	assert.ok(names.includes("glob"), "renamed find lands as glob");
+	assert.ok(names.includes("ls"), "ls kept verbatim");
+	const glob = tools.find((t) => t.function.name === "glob")!;
+	assert.equal(glob.function.description, "f", "original find description verbatim");
+	assert.deepEqual(glob.function.parameters, { type: "object", properties: { pattern: { type: "string" } } });
+});
+
+test("sseToMessagesJson: aggregates anthropic content deltas into one message", () => {
+	const sse = [
+		'event: message_start',
+		'data: {"type":"message_start","message":{"id":"msg_1","model":"union-alpha"}}',
+		"",
+		'event: content_block_start',
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+		"",
+		'event: content_block_delta',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}',
+		"",
+		'event: content_block_delta',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}',
+		"",
+		'event: message_delta',
+		'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5,"output_tokens":3}}',
+		"",
+	].join("\n");
+	const msg = sseToMessagesJson(sse, false);
+	assert.equal(msg.id, "msg_1");
+	assert.equal(msg.type, "message");
+	assert.equal(msg.role, "assistant");
+	assert.deepEqual(msg.content, [{ type: "text", text: "hello world" }]);
+	assert.equal(msg.stop_reason, "end_turn");
+});
+
+test("sseToMessagesJson: tool_use blocks survive only when the caller had tools", () => {
+	const sse = [
+		'event: content_block_start',
+		'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash"}}',
+		"",
+		'event: content_block_delta',
+		'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"ls\\"}"}}',
+		"",
+	].join("\n");
+	const withTools = sseToMessagesJson(sse, true);
+	assert.deepEqual(withTools.content, [
+		{ type: "tool_use", id: "toolu_1", name: "bash", input: { command: "ls" } },
+	]);
+	const withoutTools = sseToMessagesJson(sse, false);
+	assert.deepEqual(withoutTools.content, [{ type: "text", text: '{"command":"ls"}' }]);
+});
+
+test("convertSseToJson: routes /v1/messages to the messages aggregator", () => {
+	const sse = [
+		'event: message_start',
+		'data: {"type":"message_start","message":{"id":"msg_9","model":"m"}}',
+		"",
+		'event: content_block_delta',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+		"",
+	].join("\n");
+	const out = JSON.parse(convertSseToJson(sse, "/v1/messages", false));
+	assert.equal(out.type, "message");
+	assert.deepEqual(out.content, [{ type: "text", text: "hi" }]);
+});
+
+function upstreamNameOf(t: Record<string, unknown>): string {
+	if (typeof t.name === "string") return t.name;
+	const fn = t.function as Record<string, unknown> | undefined;
+	return String((fn as Record<string, unknown>).name);
+}
+function upstreamParamsOf(t: Record<string, unknown>): unknown {
+	const fn = t.function as Record<string, unknown> | undefined;
+	if (fn && typeof fn === "object" && "parameters" in fn) return (fn as Record<string, unknown>).parameters;
+	if ("parameters" in t) return t.parameters;
+	return (t as Record<string, unknown>).input_schema;
+}
+function upstreamDescOf(t: Record<string, unknown>): unknown {
+	const fn = t.function as Record<string, unknown> | undefined;
+	if (fn && typeof fn === "object" && "description" in fn) return (fn as Record<string, unknown>).description;
+	return t.description;
+}
+const MATRIX_TOOLS = [
+	"ls",
+	"powershell",
+	"edit",
+	"write",
+	"read",
+	"bash",
+	"grep",
+	"ask",
+	"todo",
+	"task",
+	"hub",
+	"eval",
+	"debug",
+	"github",
+	"lsp",
+	"checkpoint",
+	"rewind",
+	"security_scan",
+	"web_search",
+	"browser",
+	"computer",
+	"learn",
+	"manage_skill",
+	"ast_grep",
+	"ast_edit",
+	"generate_image",
+	"tts",
+] as const;
+function matrixTool(style: "chat" | "responses" | "anthropic", name: string): Record<string, unknown> {
+	const params = { type: "object", properties: { [name]: { type: "string" } } };
+	const description = `${name} desc`;
+	if (style === "chat") return { type: "function", function: { name, description, parameters: params }, strict: true, x_extra: `x-${name}` };
+	if (style === "responses") return { type: "function", name, description, parameters: params, strict: true, x_extra: `x-${name}` };
+	return { name, description, input_schema: params, strict: true, x_extra: `x-${name}` };
+}
+test("translateToolsForPath: matrix shared + OMP uniques survive verbatim, no additionalProperties", () => {
+	for (const style of ["chat", "responses", "anthropic"] as const) {
+		for (const path of PATHS) {
+			for (const name of MATRIX_TOOLS) {
+				const [out] = translateToolsForPath([matrixTool(style, name)], path);
+				assert.ok(out, `${style} -> ${path} ${name}: not dropped`);
+				assert.equal(upstreamNameOf(out), name, `${style} -> ${path} ${name}: name verbatim`);
+				assert.equal(upstreamDescOf(out), `${name} desc`, `${style} -> ${path} ${name}: description verbatim`);
+				assert.deepEqual(upstreamParamsOf(out), { type: "object", properties: { [name]: { type: "string" } } }, `${style} -> ${path} ${name}: params verbatim`);
+				assert.equal((out as Record<string, unknown>).strict, true, `${style} -> ${path} ${name}: strict verbatim`);
+				assert.equal((out as Record<string, unknown>).x_extra, `x-${name}`, `${style} -> ${path} ${name}: extra field carried`);
+				assert.ok(!JSON.stringify(upstreamParamsOf(out)).includes("additionalProperties"), `${style} -> ${path} ${name}: never injects additionalProperties`);
+			}
 		}
+	}
+});
+test("translateToolsForPath: unknown mcp custom tools survive every shape x path", () => {
+	const names = ["mcp__github__search_code", "my_custom_tool", "xd://browser__open", "some_unknown_tool_xyz"];
+	for (const style of ["chat", "responses", "anthropic"] as const) {
+		for (const path of PATHS) {
+			const input = names.map((name) => matrixTool(style, name));
+			const restore = buildFindGlobRestore(input);
+			const out = translateToolsForPath(input, path);
+			assert.equal(out.length, names.length, `${style} -> ${path}: nothing dropped`);
+			for (const name of names) {
+				// Looked up by the name the caller gets back: a caller name
+				// upstream rejects (`xd://…`) is rewritten on the wire and
+				// restored here, so this asserts the round-trip, not the wire
+				// spelling. Everything else is byte-identical.
+				const upstreamName = upstreamNameOf(
+					out.find((t) => restoreToolNameForCaller(upstreamNameOf(t), restore) === name)!,
+				);
+				assert.ok(out.some((t) => upstreamNameOf(t) === upstreamName), `${style} -> ${path}: keeps ${name}`);
+				const found = out.find((t) => upstreamNameOf(t) === upstreamName)!;
+				assert.deepEqual(upstreamParamsOf(found), { type: "object", properties: { [name]: { type: "string" } } });
+				assert.ok(!JSON.stringify(upstreamParamsOf(found)).includes("additionalProperties"));
+			}
+		}
+	}
+});
+test("translateToolsForPath: Pi find renames to glob on all shapes, OMP glob untouched, restore both ways", () => {
+	const findParams = { type: "object", properties: { pattern: { type: "string" } } };
+	const styles = ["chat", "responses", "anthropic"] as const;
+	const makeFind = (style: (typeof styles)[number]): Record<string, unknown> => {
+		if (style === "chat") return { type: "function", function: { name: "find", description: "f", parameters: findParams } };
+		if (style === "responses") return { type: "function", name: "find", description: "f", parameters: findParams };
+		return { name: "find", description: "f", input_schema: findParams };
+	};
+	for (const style of styles) {
+		for (const path of PATHS) {
+			const [out] = translateToolsForPath([makeFind(style)], path, { forFingerprint: true });
+			assert.equal(upstreamNameOf(out), "glob", `${style} -> ${path}: the fingerprint lane renames find to glob`);
+			assert.equal(upstreamDescOf(out), "f", `${style} -> ${path}: find description verbatim`);
+			assert.deepEqual(upstreamParamsOf(out), findParams, `${style} -> ${path}: find params verbatim`);
+		}
+	}
+	for (const style of styles) {
+		for (const path of PATHS) {
+			const globInput = style === "chat"
+				? { type: "function", function: { name: "glob", description: "g", parameters: { type: "object" } } }
+				: style === "responses"
+					? { type: "function", name: "glob", description: "g", parameters: { type: "object" } }
+					: { name: "glob", description: "g", input_schema: { type: "object" } };
+			const [out] = translateToolsForPath([globInput], path);
+			assert.equal(upstreamNameOf(out), "glob", `${style} -> ${path}: OMP glob untouched`);
+		}
+	}
+	assert.equal(upstreamToolNameFor("find"), "glob");
+	assert.equal(upstreamToolNameFor("Find"), "glob");
+	assert.equal(upstreamToolNameFor("glob"), "glob");
+	const renamed = buildFindGlobRestore([{ type: "function", name: "find", description: "f", parameters: { type: "object" } }]);
+	assert.equal(renamed.renamedFindToGlob, true);
+	assert.equal(restoreToolNameForCaller("glob", renamed), "find");
+	assert.equal(restoreToolNameForCaller("read", renamed), "read");
+	const both = buildFindGlobRestore([
+		{ type: "function", name: "find", description: "f", parameters: { type: "object" } },
+		{ type: "function", name: "glob", description: "g", parameters: { type: "object" } },
+	]);
+	assert.equal(both.renamedFindToGlob, false, "find+glob together never restores");
+	assert.equal(restoreToolNameForCaller("glob", both), "glob");
+	const none = buildFindGlobRestore([{ type: "function", name: "read", description: "r", parameters: { type: "object" } }]);
+	assert.equal(none.renamedFindToGlob, false);
+	assert.deepEqual(retargetToolChoiceForUpstream({ type: "function", name: "find" }, renamed), { type: "function", name: "glob" });
+	assert.deepEqual(retargetToolChoiceForUpstream({ type: "function", function: { name: "find" } }, renamed), { type: "function", function: { name: "glob" } });
+	assert.equal(retargetToolChoiceForUpstream("auto", renamed), "auto", "tool_choice auto never retargeted");
+});
+test("translateToolsForPath: dup collapse case-insensitive, second translate adds zero", () => {
+	const dupes = [
+		{ type: "function", function: { name: "bash", description: "a", parameters: { type: "object" } } },
+		{ type: "function", name: "Bash", description: "b", parameters: { type: "object" } },
+		{ name: "BASH", description: "c", input_schema: { type: "object" } },
+	];
+	for (const path of PATHS) {
+		const out = translateToolsForPath(dupes, path);
+		assert.equal(out.length, 1, `${path}: Bash collapses to bash`);
+		assert.equal(upstreamNameOf(out[0]).toLowerCase(), "bash");
+		const again = translateToolsForPath(out, path);
+		assert.equal(again.length, 1, `${path}: idempotent, second translate adds zero`);
+	}
+	// OMP declares both: `find` keeps its own name so the model sees two real
+	// tools instead of one under the other's schema.
+	const findGlob = [
+		{ type: "function", name: "find", description: "f", parameters: { type: "object" } },
+		{ type: "function", name: "glob", description: "g", parameters: { type: "object" } },
+	];
+	const kept = translateToolsForPath(findGlob, "/v1/responses");
+	assert.deepEqual(kept.map(upstreamNameOf), ["find", "glob"], "find survives beside a declared glob");
+	assert.equal(buildFindGlobRestore(findGlob).renamedFindToGlob, false, "no rename to undo");
+	// Pi declares `find` alone: it must still fill the sextet's glob slot.
+	const piFind = translateToolsForPath([findGlob[0]], "/v1/responses", { forFingerprint: true });
+	assert.deepEqual(piFind.map(upstreamNameOf), ["glob"], "a lone Pi find rides upstream as glob");
+	assert.equal(buildFindGlobRestore([findGlob[0]]).renamedFindToGlob, true);
+	const reTranslated = translateToolsForPath(kept, "/v1/responses");
+	assert.deepEqual(reTranslated.map(upstreamNameOf), ["find", "glob"], "re-translate adds zero");
+});
+test("translateToolsForPath: hidden plus full host sets survive every path", () => {
+	const hidden = ["yield", "goal", "think"];
+	for (const path of PATHS) {
+		const out = translateToolsForPath(sampleTools("chat", hidden), path);
+		assert.equal(out.length, hidden.length, `${path}: hidden tools never dropped`);
+		for (const name of hidden) assert.ok(out.some((t) => upstreamNameOf(t) === name), `${path}: keeps hidden ${name}`);
+	}
+	for (const path of PATHS) {
+		const combined = [...OMP_TOOL_NAMES, ...OMP_HIDDEN_TOOL_NAMES, ...OMP_CUSTOM_TOOL_NAMES, ...PI_TOOL_NAMES].map((name) => ({ type: "function", name, description: `${name} tool`, parameters: { type: "object" } }));
+		const out = translateToolsForPath(combined, path);
+		const declared = new Set(combined.map((t) => String(t.name).toLowerCase()));
+		const names = out.map(upstreamNameOf);
+		assert.equal(new Set(names.map((n) => n.toLowerCase())).size, names.length, `${path}: no duplicate upstream names`);
+		for (const name of declared) assert.ok(names.includes(name), `${path}: keeps ${name}`);
+		assert.equal(out.length, declared.size, `${path}: nothing dropped, nothing invented`);
+		assert.ok(names.includes("ls") && names.includes("powershell"), `${path}: Pi ls/powershell verbatim`);
+		assert.ok(names.includes("browser") && names.includes("computer"), `${path}: OMP browser/computer present`);
+		assert.ok(names.includes("generate_image") && names.includes("tts"), `${path}: OMP custom tools survive`);
+	}
+});
+
+/**
+ * Full-inventory round-trip contract (E2eMatrixTests): every caller-declared
+ * schema rides upstream VERBATIM on all three wire paths — params,
+ * description, required, strict, and extra top-level fields — the fingerprint
+ * sextet appears exactly once, and downstream restore maps glob->find plus
+ * caller casing. Fails without PassthroughFix if translation rewrites schemas
+ * or duplicates/drops fingerprint slots.
+ */
+function richCallerTool(name: string, host: string): Record<string, unknown> {
+	return {
+		type: "function",
+		function: {
+			name,
+			description: `${name} host tool`,
+			parameters: {
+				type: "object",
+				properties: {
+					input: { type: "string", description: `${name} primary input` },
+					opts: { type: "object", properties: { verbose: { type: "boolean" } } },
+				},
+				required: ["input"],
+			},
+		},
+		strict: true,
+		"x-host": host,
+	};
+}
+
+function upstreamSchemaOf(t: Record<string, unknown>): Record<string, unknown> {
+	const fn = t.function as Record<string, unknown> | undefined;
+	const cand = fn?.parameters ?? (t as Record<string, unknown>).parameters ?? (t as Record<string, unknown>).input_schema;
+	return cand as Record<string, unknown>;
+}
+
+test("contract: full Pi inventory round-trips verbatim on all three paths", () => {
+	// This contract is about the fingerprint sextet, so it runs the translation
+	// the OpenCode lane actually performs: the rename into the `glob` slot is
+	// what makes Pi's `find` and the sextet's `glob` the same declaration.
+	for (const path of PATHS) {
+		const caller = PI_TOOL_NAMES.map((n) => richCallerTool(n, "pi"));
+		const snapshot = JSON.parse(JSON.stringify(caller)) as Array<Record<string, unknown>>;
+		const translated = translateToolsForPath(caller, path, { forFingerprint: true });
+		const withFp = withFingerprintTools([...translated], path);
+		const names = withFp.map((t) => upstreamNameOf(t).toLowerCase());
+		assert.equal(names.length, new Set(names).size, `${path}: no duplicate upstream names`);
+		for (const fp of OPENCODE_FINGERPRINT_TOOLS) {
+			assert.equal(names.filter((n) => n === fp).length, 1, `${path}: fingerprint ${fp} exactly once`);
+		}
+		assert.ok(names.includes("find") || names.includes("glob"), `${path}: caller find reaches upstream under a tool name`);
+		for (const orig of snapshot) {
+			const fn = orig.function as Record<string, unknown>;
+			const cname = String(fn.name);
+			const uname = cname.toLowerCase() === "find" ? "glob" : cname;
+			const hit = withFp.find((t) => upstreamNameOf(t).toLowerCase() === uname.toLowerCase());
+			assert.ok(hit, `${path}: keeps caller tool ${cname}`);
+			assert.equal(upstreamDescOf(hit!), `${cname} host tool`, `${path}: ${cname} description verbatim`);
+			assert.deepEqual(upstreamSchemaOf(hit!), (fn.parameters as Record<string, unknown>), `${path}: ${cname} params verbatim`);
+			assert.equal((hit as Record<string, unknown>).strict, true, `${path}: ${cname} strict verbatim`);
+			assert.equal((hit as Record<string, unknown>)["x-host"], "pi", `${path}: ${cname} extra field verbatim`);
+		}
+		const restore = buildFindGlobRestore(caller);
+		assert.equal(restore.renamedFindToGlob, true, `${path}: Pi find->glob rename recorded`);
+		assert.equal(restoreToolNameForCaller("glob", restore), "find", `${path}: upstream glob restores to caller find`);
+		assert.equal(restoreToolNameForCaller("read", restore), "read", `${path}: untouched names restore verbatim`);
+	}
+});
+
+test("contract: full OMP inventory round-trips verbatim, zero injected", () => {
+	const all = [...OMP_TOOL_NAMES, ...OMP_HIDDEN_TOOL_NAMES, ...OMP_CUSTOM_TOOL_NAMES];
+	for (const path of PATHS) {
+		const caller = all.map((n) => richCallerTool(n, "omp"));
+		const translated = translateToolsForPath(caller, path);
+		assert.equal(translated.length, all.length, `${path}: OMP covers every fingerprint slot, nothing added or dropped`);
+		const names = translated.map((t) => upstreamNameOf(t).toLowerCase());
+		for (const fp of OPENCODE_FINGERPRINT_TOOLS) {
+			assert.equal(names.filter((n) => n === fp).length, 1, `${path}: fingerprint ${fp} exactly once`);
+		}
+		for (const tool of translated) {
+			const uname = upstreamNameOf(tool);
+			const orig = caller.find((c) => String((c.function as Record<string, unknown>).name).toLowerCase() === uname.toLowerCase());
+			assert.ok(orig, `${path}: upstream ${uname} maps to a caller tool`);
+			assert.equal(upstreamDescOf(tool), `${(orig!.function as Record<string, unknown>).name} host tool`, `${path}: ${uname} description verbatim`);
+			assert.deepEqual(upstreamSchemaOf(tool), ((orig!.function as Record<string, unknown>).parameters as Record<string, unknown>), `${path}: ${uname} params verbatim`);
+			assert.equal((tool as Record<string, unknown>)["x-host"], "omp", `${path}: ${uname} extra field verbatim`);
+		}
+		const again = withFingerprintTools([...translated], path);
+		assert.equal(again.length, translated.length, `${path}: re-inject adds zero when caller owns every slot`);
+	}
+});
+
+test("contract: OMP-like injected glob uses the host path-optional schema", () => {
+	// Catches PassthroughFix bug #1: the old injected glob demanded
+	// {pattern: required}, but the real OMP GlobTool carries its pattern in an
+	// OPTIONAL `path` field ({path?, hidden?, gitignore?, limit?}). A model
+	// handed the old def emits pattern-shaped calls the host cannot execute.
+	for (const path of PATHS) {
+		const caller = [richCallerTool("ask", "omp"), richCallerTool("todo", "omp")];
+		const withFp = withFingerprintTools(translateToolsForPath(caller, path), path);
+		const glob = withFp.find((t) => upstreamNameOf(t).toLowerCase() === "glob");
+		assert.ok(glob, `${path}: missing glob is injected for OMP-like callers`);
+		const schema = upstreamSchemaOf(glob!) as { properties?: Record<string, unknown>; required?: unknown };
+		assert.ok(schema.properties && typeof schema.properties === "object", `${path}: injected glob has executable properties`);
+		assert.ok("path" in (schema.properties as Record<string, unknown>), `${path}: injected glob accepts the host path field`);
+		const required = Array.isArray(schema.required) ? (schema.required as unknown[]) : [];
+		assert.ok(!required.includes("pattern"), `${path}: injected glob must not demand pattern`);
+	}
+});
+
+test("contract: injected edit never ships the unexecutable path+edit shape", () => {
+	// Catches PassthroughFix bug #2: the old injected edit used
+	// {path, edit: string}, which matches NO host (OMP default is hashline
+	// {input}, Pi wants an edits[] array) yet rode the cloak-exempt path, so
+	// models could invoke a def the host rejects. Fixed behavior: a cloaked
+	// COMPAT placeholder, or the real OMP hashline {input} def.
+	for (const path of PATHS) {
+		const caller = [richCallerTool("ask", "omp"), richCallerTool("todo", "omp")];
+		const withFp = withFingerprintTools(translateToolsForPath(caller, path), path);
+		const edit = withFp.find((t) => upstreamNameOf(t).toLowerCase() === "edit");
+		assert.ok(edit, `${path}: missing edit is injected for OMP-like callers`);
+		const schema = upstreamSchemaOf(edit!) as { properties?: Record<string, unknown> };
+		const props = (schema.properties ?? {}) as Record<string, unknown>;
+		const desc = String(upstreamDescOf(edit!));
+		const isCompat = desc === COMPAT_TOOL_DESCRIPTION;
+		const isHashline = "input" in props;
+		const isOldBroken = "edit" in props && !("input" in props) && !isCompat;
+		assert.ok(!isOldBroken, `${path}: injected edit must not use the {path, edit} shape`);
+		assert.ok(isCompat || isHashline, `${path}: injected edit is a cloaked placeholder or the host hashline def`);
+	}
+});
+
+test("contract: aggregate cloak strips injected-only, restores caller names, keeps ids/args", () => {
+	// Regression guard for CloakStreamFix: only names in this request's
+	// injected[] list are stripped; caller-owned same-name calls survive with
+	// casing + glob->find restored, ids and argument payloads value-identical.
+	// `injected` holds only truly-missing slots: caller-owned bash/read/glob are
+	// absent so they survive; caller-less grep is present so it strips. This is
+	// the observable proof of the injected-only rule: same-name caller calls are
+	// indistinguishable by name and must survive.
+	const injected = ["grep", "edit", "write"];
+	const caseRestore = { bash: "Bash" };
+	const findGlob = { renamedFindToGlob: true };
+	const chatFrame = (delta: unknown, finish?: string): string =>
+		`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta, ...(finish ? { finish_reason: finish } : {}) }] })}`;
+	const chatSse = [
+		chatFrame({
+			tool_calls: [
+				{ index: 0, id: "call_bash_9", type: "function", function: { name: "bash", arguments: '{"command":"ls é"}' } },
+				{ index: 1, id: "call_grep_9", type: "function", function: { name: "grep", arguments: '{"pattern":"x"}' } },
+				{ index: 2, id: "call_glob_9", type: "function", function: { name: "glob", arguments: '{"pattern":"*.ts"}' } },
+			]
+		}),
+		chatFrame({}, "tool_calls"),
+		"data: [DONE]",
+	].join("\n\n");
+	const chat = sseToChatCompletionJson(chatSse, true, caseRestore, findGlob, injected) as {
+		choices: Array<{ message: { tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+	};
+	const chatCalls = chat.choices[0].message.tool_calls ?? [];
+	assert.deepEqual(chatCalls.map((c) => c.function.name), ["Bash", "find"], "caller Bash keeps casing, upstream glob restores to find, injected grep stripped");
+	assert.equal(chatCalls[0].id, "call_bash_9", "caller call id preserved");
+	assert.equal(chatCalls[0].function.arguments, '{"command":"ls é"}', "caller args value-preserved through restore");
+	assert.ok(!JSON.stringify(chat).includes("call_grep_9"), "stripped call id never leaks");
+
+	const respSse = [
+		'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_9","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_read_9","name":"read","arguments":"{\\"path\\":\\"a.txt\\"}"},{"type":"function_call","id":"fc_grep_9","name":"grep","arguments":"{\\"pattern\\":\\"x\\"}"},{"type":"function_call","id":"fc_glob_9","name":"glob","arguments":"{\\"pattern\\":\\"*.ts\\"}"}]}}',
+	].join("\n\n");
+	const resp = sseToResponsesJson(respSse, true, caseRestore, findGlob, injected) as {
+		output: Array<{ type: string; id?: string; name?: string; arguments?: string }>;
+	};
+	const calls = resp.output.filter((o) => o.type === "function_call");
+	assert.deepEqual(calls.map((c) => c.name).sort(), ["find", "read"], "responses keeps caller calls only, injected grep stripped");
+	assert.ok(calls.some((c) => c.name === "find" && c.id === "fc_glob_9" && c.arguments === '{"pattern":"*.ts"}'), "glob restores to find with id/args intact");
+	assert.ok(calls.some((c) => c.name === "read" && c.id === "fc_read_9"), "caller read survives with id intact");
+	assert.ok(!calls.some((c) => c.name === "grep"), "injected grep stripped");
+
+	const msgSse = [
+		'data: {"type":"message_start","message":{"id":"msg_9","model":"m"}}',
+		'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_bash_9","name":"bash"}}',
+		'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"cmd\\":\\"ls\\"}"}}',
+		'data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_grep_9","name":"grep"}}',
+		'data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\\"pattern\\":\\"x\\"}"}}',
+		'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+	].join("\n\n");
+	const msg = sseToMessagesJson(msgSse, true, caseRestore, findGlob, injected) as {
+		content: Array<{ type: string; id?: string; name?: string; input?: unknown }>;
+	};
+	const uses = msg.content.filter((b) => b.type === "tool_use");
+	assert.equal(uses.length, 1, "messages strips the injected grep block");
+	assert.equal(uses[0].name, "Bash", "messages restores caller casing");
+	assert.equal(uses[0].id, "tu_bash_9", "messages preserves the block id");
+	assert.deepEqual(uses[0].input, { cmd: "ls" }, "messages aggregates input deltas");
+});
+
+test("contract: cline body translation reshapes tools with zero fingerprint", () => {
+	// Kilo/Cline paths bypass the fingerprint entirely: tools are only
+	// reshaped to chat, never injected, and the stream policy is untouched.
+	const caller = [richCallerTool("ask", "omp"), richCallerTool("find", "pi")];
+	const out = chatBodyFromResponsesBody({
+		model: "cline-free/deepseek-v4.1-flash",
+		input: [{ role: "user", content: "hi" }],
+		tools: JSON.parse(JSON.stringify(caller)),
+		tool_choice: "auto",
+		stream: false,
+	});
+	assert.ok(Array.isArray(out.tools), "cline tools ride along");
+	assert.equal((out.tools as unknown[]).length, 2, "cline adds zero fingerprint tools");
+	assert.ok(!("stream" in out), "cline translation never imposes a stream policy");
+	assert.equal(out.tool_choice, "auto", "cline carries tool_choice verbatim");
+});
+test("contract: the responses-native output cap reaches the chat-only lanes", () => {
+	// `max_output_tokens` is the field a host sets on /v1/responses. It was not
+	// on the chat whitelist, so on the Cline/OVH lanes the cap vanished and the
+	// model answered at its own default length.
+	const out = chatBodyFromResponsesBody({
+		model: "cline-free/deepseek-v4.1-flash",
+		input: "hi",
+		max_output_tokens: 4096,
+	});
+	assert.equal(out.max_output_tokens, 4096, "the output cap survives the shape mapping");
+});
+test("contract: OMP gated custom tools are caller tools end-to-end, never cloaked", () => {
+	// Row 3: generate_image + tts ride as ordinary caller tools. OMP-like caller
+	// (todo marker + glob-without-find) on the responses path: the pair must
+	// survive enforce unrenamed, land in neither injected list, and model calls
+	// to them must survive the downstream cloak like any caller call.
+	const imgParams = { type: "object", properties: { subject: { type: "string" } }, required: ["subject"] };
+	const ttsParams = { type: "object", properties: { text: { type: "string" } }, required: ["text"] };
+	const imgArgs = '{"subject":"a red boat"}';
+	const ttsArgs = '{"text":"hello there"}';
+	const body: Record<string, unknown> = {
+		model: "zen-reasoner-free",
+		stream: false,
+		tools: [
+			{ type: "function", function: { name: "todo", description: "plan" } },
+			{ type: "function", function: { name: "glob", description: "g" } },
+			{ type: "function", function: { name: "generate_image", description: "Generate or edit an image", parameters: imgParams }, strict: false },
+			{ type: "function", function: { name: "tts", description: "Synthesize speech", parameters: ttsParams }, strict: false },
+		],
+	};
+	const r = enforceOpencodeFingerprint(body, "/v1/responses");
+	assert.equal(r.callerHadTools, true);
+	assert.deepEqual(r.injected, ["edit"], "only the truly-missing edit cloaks; customs never do");
+	assert.deepEqual(r.injectedReal, ["bash", "grep", "read", "write"], "customs never placeholder-injected either");
+	const tools = body.tools as Array<Record<string, unknown>>;
+	assert.equal(tools.length, 9, "4 caller + 5 missing fingerprint tools, zero dropped");
+	for (const n of ["generate_image", "tts"]) {
+		const found = tools.find((t) => toolNameOf(t) === n);
+		assert.ok(found, `${n} survives enforce unrenamed`);
+		assert.equal(found?.strict, false, `${n} strict:false verbatim through enforce`);
+		assert.equal(found?.type, "function", `${n} lands in responses shape`);
+	}
+	// Downstream: upstream answers with calls to both customs plus an injected
+	// placeholder (edit, must strip) and an injected-real (bash, executable,
+	// must survive like any caller call).
+	const output = [
+		{ type: "function_call", id: "fc_img_1", call_id: "call_img_1", name: "generate_image", arguments: imgArgs },
+		{ type: "function_call", id: "fc_tts_1", call_id: "call_tts_1", name: "tts", arguments: ttsArgs },
+		{ type: "function_call", id: "fc_bash_1", call_id: "call_bash_1", name: "bash", arguments: '{"command":"ls"}' },
+		{ type: "function_call", id: "fc_edit_1", call_id: "call_edit_1", name: "edit", arguments: '{"edits":[]}' },
+	];
+	const respSse = [
+		"event: response.completed",
+		`data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_c", object: "response", status: "completed", output } })}`,
+	].join("\n");
+	const resp = sseToResponsesJson(respSse, r.callerHadTools, r.caseRestore, r.findGlob, r.injected) as {
+		output: Array<{ type: string; id?: string; call_id?: string; name?: string; arguments?: string }>;
+	};
+	const calls = resp.output.filter((o) => o.type === "function_call");
+	assert.deepEqual(calls.map((c) => c.name).sort(), ["bash", "generate_image", "tts"], "custom + injected-real calls persist, injected edit stripped");
+	assert.ok(calls.some((c) => c.name === "generate_image" && c.id === "fc_img_1" && c.call_id === "call_img_1" && c.arguments === imgArgs), "generate_image id/args verbatim");
+	assert.ok(calls.some((c) => c.name === "tts" && c.id === "fc_tts_1" && c.arguments === ttsArgs), "tts id/args verbatim");
+	assert.ok(!calls.some((c) => c.name === "edit"), "injected edit stripped");
+	// Same stream through the universal router.
+	const back = JSON.parse(convertSseToJson(respSse, "/v1/responses", r.callerHadTools, r.caseRestore, r.findGlob, r.injected)) as {
+		output: Array<{ type: string; name?: string }>;
+	};
+	assert.deepEqual(back.output.filter((o) => o.type === "function_call").map((c) => c.name).sort(), ["bash", "generate_image", "tts"], "convertSseToJson routes responses identically");
+	// Chat-path mirror: a tool_calls entry for generate_image survives, edit strips.
+	const chatSse = [
+		`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: { tool_calls: [
+			{ index: 0, id: "call_img_c", type: "function", function: { name: "generate_image", arguments: imgArgs } },
+			{ index: 1, id: "call_edit_c", type: "function", function: { name: "edit", arguments: '{"edits":[]}' } },
+		] } }] })}`,
+		`data: ${JSON.stringify({ id: "c1", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
+		"data: [DONE]",
+	].join("\n\n");
+	const chat = JSON.parse(convertSseToJson(chatSse, "/v1/chat/completions", r.callerHadTools, r.caseRestore, r.findGlob, r.injected)) as {
+		choices: Array<{ message: { tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>; 
+	};
+	const chatCalls = chat.choices[0].message.tool_calls ?? [];
+	assert.deepEqual(chatCalls.map((c) => c.function.name), ["generate_image"], "chat cloak keeps the custom call, strips injected edit");
+	assert.equal(chatCalls[0].id, "call_img_c", "chat custom call id preserved");
+	assert.equal(chatCalls[0].function.arguments, imgArgs, "chat custom args verbatim");
+});
+
+test("contract: prompt_cache_key rides the Zen responses path untouched, never a compat flag", () => {
+	// Verdict (research row 20): DO NOT emit supportsPromptCacheKey.
+	// - Pi host (reference/pi packages/ai openai-completions.ts) keys chat-path
+	//   prompt_cache_key off baseUrl api.openai.com / supportsLongCacheRetention,
+	//   never off supportsPromptCacheKey: the symbol means nothing to Pi.
+	// - OMP host sends it on responses UNGATED (openai-responses.ts always sets
+	//   prompt_cache_key from the session) so no flag is needed where the key is
+	//   load-bearing: caller-bound blob memory, relay affinity, gate failover.
+	// - Emitting the flag WOULD change OMP chat-path wire behavior (a new field
+	//   forwarded verbatim upstream) with no live proof Zen/Kilo chat tolerates
+	//   it; the chat-path consumer (sessionKeyOf) already falls back to a
+	//   content hash. Status quo plus this passthrough lock is the safe contract.
+	// The sole strip (Cline reshape, proxy.ts) is correct and out of scope here:
+	// Cline has no blob memory, so the key must not ride a translated chat body.
+	const key = "sess_conv_abc123";
+	const body: Record<string, unknown> = {
+		model: "zen-reasoner-free",
+		stream: false,
+		prompt_cache_key: key,
+		input: [{ role: "user", content: "hi" }],
+		tools: [{ type: "function", function: { name: "todo", description: "plan" } }],
+	};
+	const r = enforceOpencodeFingerprint(body, "/v1/responses");
+	assert.equal(body.prompt_cache_key, key, "responses enforce never strips the conversation key");
+	assert.equal(body.stream, true, "fingerprint stream force still applies alongside the key");
+	assert.equal(r.callerHadTools, true);
+	// Chat-path enforce (non-Cline Zen) carries it too: no normalization drops it.
+	const chatBody: Record<string, unknown> = {
+		model: "zen-reasoner-free",
+		prompt_cache_key: key,
+		messages: [{ role: "user", content: "hi" }],
+		tools: [{ type: "function", function: { name: "todo", description: "plan" } }],
+	};
+	enforceOpencodeFingerprint(chatBody, "/v1/chat/completions");
+	assert.equal(chatBody.prompt_cache_key, key, "chat enforce never strips the conversation key");
+});
+
+test("sanitizeUpstreamToolName: legal names are returned unchanged", () => {
+	const taken = new Set<string>();
+	for (const name of ["bash", "read", "write", "edit", "grep", "glob", "todo_write", "web.search", "mcp--srv.tool", "a-b.c"]) {
+		assert.equal(sanitizeUpstreamToolName(name, taken), name, `${name} must not be rewritten`);
+		taken.add(name.toLowerCase());
+	}
+});
+
+test("sanitizeUpstreamToolName: illegal characters fold to underscores", () => {
+	const taken = new Set<string>();
+	// Names measured in live Pi sessions.
+	assert.equal(sanitizeUpstreamToolName("TG drive", taken), "TG_drive");
+	taken.add("tg_drive");
+	assert.equal(sanitizeUpstreamToolName("env:production", taken), "env_production");
+	assert.equal(sanitizeUpstreamToolName("mcp:server__tool", taken), "mcp_server__tool");
+	assert.equal(sanitizeUpstreamToolName("fs/read", taken), "fs_read");
+	assert.equal(sanitizeUpstreamToolName("a b", taken), "a_b");
+});
+
+test("sanitizeUpstreamToolName: a collision takes a numeric suffix", () => {
+	const taken = new Set<string>();
+	assert.equal(sanitizeUpstreamToolName("TG drive", taken), "TG_drive");
+	taken.add("tg_drive");
+	assert.equal(sanitizeUpstreamToolName("TG:drive", taken), "TG_drive_2");
+	taken.add("tg_drive_2");
+	// `!` folds to `_`, which is legal and unclaimed, so no suffix is needed.
+	assert.equal(sanitizeUpstreamToolName("TG drive!", taken), "TG_drive_");
+	taken.add("tg_drive_");
+	// Now it genuinely collides, so the suffix loop takes over.
+	assert.equal(sanitizeUpstreamToolName("TG drive?", taken), "TG_drive__2");
+	assert.equal(sanitizeUpstreamToolName("TG-drive", new Set()), "TG-drive", "a legal name never collides");
+});
+
+test("tool names upstream would reject are rewritten and restored downstream", () => {
+	const tools = [
+		{ type: "function", name: "TG drive", description: "a", parameters: { type: "object", properties: {} } },
+		{ type: "function", name: "TG:drive", description: "b", parameters: { type: "object", properties: {} } },
+		{ type: "function", name: "bash", description: "c", parameters: { type: "object", properties: {} } },
+	];
+	const restore = buildFindGlobRestore(tools);
+
+	for (const path of ["/v1/responses", "/v1/chat/completions", "/v1/messages"]) {
+		const translated = translateToolsForPath(tools, path);
+		const names = translated.map((t) => toolNameOf(t));
+		for (const name of names) {
+			assert.match(name, /^[a-zA-Z0-9_.-]+$/, `${path}: ${name} must satisfy upstream`);
+		}
+		assert.deepEqual(
+			names.map((n) => restoreToolNameForCaller(n, restore)),
+			["TG drive", "TG:drive", "bash"],
+			`${path}: every caller's own name comes back`,
+		);
+		assert.equal(names[2], "bash", `${path}: a legal name is never rewritten`);
+	}
+
+	const responses = translateToolsForPath(tools, "/v1/responses");
+	assert.deepEqual(
+		responses.map((t) => (t as Record<string, unknown>).name),
+		["TG_drive", "TG_drive_2", "bash"],
+		"colliding illegal names get distinct upstream names",
+	);
+	const chat = translateToolsForPath(tools, "/v1/chat/completions");
+	assert.deepEqual(
+		chat.map((t) => (t as Record<string, Record<string, unknown>>).function.name),
+		["TG_drive", "TG_drive_2", "bash"],
+		"chat wrapper carries the same upstream names",
+	);
+});
+
+test("a sanitized tool name round-trips through a full streamed response", () => {
+	const tools = [
+		{ type: "function", name: "TG drive", description: "d", parameters: { type: "object", properties: {} } },
+	];
+	const restore = buildFindGlobRestore(tools);
+	const sse = [
+		'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_x","object":"response","status":"completed","output":[{"type":"function_call","id":"fc_x","name":"TG_drive","arguments":"{}"}]}}',
+	].join("\n\n");
+	const resp = sseToResponsesJson(sse, true, undefined, restore, []) as {
+		output: Array<{ type: string; name?: string }>;
+	};
+	const calls = resp.output.filter((o) => o.type === "function_call");
+	assert.deepEqual(
+		calls.map((c) => c.name),
+		["TG drive"],
+		"the model called the sanitized name; the caller must still get its own",
+	);
+});
+
+test("chatResponsesSseFromChatCompletion emits response.output_text.delta so UI never sees blank reply", () => {
+	const chat = {
+		id: "chatcmpl_test",
+		model: "cline-free/muse-spark-1.3-contributor",
+		choices: [{
+			message: { role: "assistant", content: "Hello from Cline!" },
+			finish_reason: "stop",
+		}],
+	};
+	const resp = chatResponsesJsonFromChatCompletion(chat, "cline-free/muse-spark-1.3-contributor");
+	const sse = chatResponsesSseFromChatCompletion(resp);
+	assert.ok(sse.includes("event: response.output_text.delta"), "must emit response.output_text.delta");
+	assert.ok(sse.includes("Hello from Cline!"), "must carry the assistant text");
+	assert.ok(sse.includes("event: response.completed"), "must emit response.completed");
+	assert.ok(sse.includes("data: [DONE]"), "must terminate with [DONE]");
+});
+
+test("chatResponsesSseFromChatCompletion frames the message item so hosts keep the text", () => {
+	const chat = {
+		id: "chatcmpl_frames",
+		model: "cline-free/muse-spark-1.3-contributor",
+		choices: [{
+			message: { role: "assistant", content: "Hello from Cline!" },
+			finish_reason: "stop",
+		}],
+	};
+	const resp = chatResponsesJsonFromChatCompletion(chat, "cline-free/muse-spark-1.3-contributor");
+
+	const frames = chatResponsesSseFromChatCompletion(resp)
+		.split("\n\n")
+		.filter((block) => block.includes("data: ") && !block.includes("[DONE]"))
+		.map((block) => JSON.parse(block.slice(block.indexOf("data: ") + 6)) as Record<string, unknown>);
+
+	// The hosts' slot rule, reproduced (Pi createSlot/getSlot in
+	// api/openai-responses-shared.ts; OMP registerOpenItem/lookupOpenItem in
+	// providers/openai-shared.ts): a text slot exists only once
+	// `response.output_item.added` opened that output_index, and a keyed
+	// `response.output_text.delta` with no open slot is DROPPED. An answer
+	// framed as bare deltas therefore reached the caller as no assistant text.
+	const openSlots = new Map<number, string>();
+	const order: Record<string, number> = {};
+	let streamedText = "";
+	let addedItem: Record<string, unknown> | undefined;
+	let doneItem: Record<string, unknown> | undefined;
+	frames.forEach((frame, index) => {
+		const outputIndex = frame.output_index as number | undefined;
+		if (frame.type === "response.output_item.added") {
+			const added = frame.item as Record<string, unknown>;
+			if (added.type === "message" && outputIndex !== undefined) {
+				openSlots.set(outputIndex, String(added.id));
+				if (addedItem === undefined) { order.added = index; addedItem = added; }
+			}
+			return;
+		}
+		if (frame.type === "response.output_text.delta") {
+			if (outputIndex === undefined || !openSlots.has(outputIndex)) return; // dropped, exactly as the hosts drop it
+			if (!("firstDelta" in order)) order.firstDelta = index;
+			streamedText += String(frame.delta);
+			return;
+		}
+		if (frame.type === "response.output_item.done") {
+			const done = frame.item as Record<string, unknown>;
+			if (done.type === "message" && doneItem === undefined) { order.done = index; doneItem = done; }
+			return;
+		}
+		if (frame.type === "response.completed" && !("completed" in order)) order.completed = index;
 	});
 
-	it("detects glob without find", () => {
-		assert.equal(isOmpLikeCaller(["read", "glob"]), true);
-		assert.equal(isOmpLikeCaller(["glob", "find"]), false);
-	});
+	assert.equal(streamedText, "Hello from Cline!", "a host applying its own slot rule must reconstruct the assistant text");
+	assert.ok(order.added < order.firstDelta, "the message item opens before its first text delta");
+	assert.ok(order.done > order.firstDelta, "the message item closes only after its text deltas");
+	assert.ok(order.done < order.completed, "the message item closes before the terminal response event");
 
-	it("returns false for a plain caller", () => {
-		assert.equal(isOmpLikeCaller(["read", "write"]), false);
-	});
+	// The item shape both hosts read at `added` (id for their text signature,
+	// status/content carrying the placeholder the real wire sends) and the final
+	// item re-stated at `done`.
+	assert.equal(addedItem?.type, "message");
+	assert.equal(typeof addedItem?.id, "string");
+	assert.equal(addedItem?.status, "in_progress");
+	assert.deepEqual(addedItem?.content, []);
+	const item = (resp.output as Array<Record<string, unknown>>)[0];
+	assert.equal(item.type, "message");
+	assert.equal(typeof item.id, "string");
+	assert.equal(addedItem?.id, item.id, "added and done must agree on the id");
+	assert.equal(item.role, "assistant");
+	assert.equal(item.status, "completed");
+	assert.deepEqual(item.content, [{ type: "output_text", text: "Hello from Cline!" }]);
+	assert.deepEqual(doneItem, item, "the done event re-states the final item, id included");
 });

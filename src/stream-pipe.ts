@@ -8,6 +8,7 @@
 import { randomUUID } from "node:crypto";
 import type * as http from "node:http";
 import type { Readable } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { isDebugEnabled, log } from "./logger.ts";
 import { markRelayFailure } from "./relay-state.ts";
 import {
@@ -15,7 +16,7 @@ import {
  WATCHDOG_SSE_MIN_SAMPLES,
  WATCHDOG_SSE_WINDOW,
 } from "./config.ts";
-import type { CaseRestoreMap, FindGlobRestore } from "./opencode-fingerprint.ts";
+import { cloakMessagesContent, type CaseRestoreMap, type FindGlobRestore } from "./opencode-fingerprint.ts";
 import { restoreToolNameForCaller } from "./tool-translation.ts";
 import { repairToolArguments } from "./tool-args.ts";
 
@@ -26,6 +27,14 @@ import { repairToolArguments } from "./tool-args.ts";
  */
 export const SUBSTANTIAL_MIN_CHUNKS = 50;
 export const SUBSTANTIAL_MIN_BYTES = 100 * 1024;
+// Bounded lookahead for a streaming response whose upstream omitted the
+// content-type: the pipe holds at most this many bytes while it waits for SSE
+// evidence, then classifies the body itself (raw passthrough on overflow —
+// a genuine SSE body opens with its first field line long before this).
+const SNIFF_WINDOW_BYTES = 8192;
+// SSE field line at a line start (`data:`/`event:`), CRLF-tolerant. Consulted
+// only while the body kind is undecided (upstream sent no content-type).
+const SSE_START_RE = /(^|\n)(data|event):/;
 // Wire markers proving the forwarded bytes already contain a tool call the
 // host may execute (responses + chat shapes). A re-fired turn would
 // regenerate those calls, so their presence vetoes the silent resume and
@@ -212,6 +221,52 @@ export function createSseStreamCloakState(): SseStreamCloakState {
 }
 
 /**
+ * Emit every tool call still holding buffered arguments, then clear the
+ * buffers. The fragments were withheld so the packet could be judged whole
+ * (see {@link SseStreamCloakState}); the terminal event that normally releases
+ * them never arrived when upstream cut the stream without one, and without
+ * this the client would receive a tool call whose `arguments` were deleted and
+ * never re-emitted. Repaired exactly as the terminal path repairs.
+ *
+ * Shape follows the pathname: Chat re-emits one `tool_calls` delta, Anthropic
+ * one `input_json_delta` per open block. Responses carries whole arguments on
+ * its `.done` event and buffers nothing, so it has nothing to flush.
+ * Returns null when nothing is buffered.
+ */
+export function flushBufferedToolArgs(
+ state: SseStreamCloakState,
+ cloak: StreamCloakOptions,
+): string | null {
+ if (state.messagesArgsByIndex.size > 0) {
+  const blocks: string[] = [];
+  for (const [index, args] of state.messagesArgsByIndex) {
+   const name = state.messagesNameByIndex.get(index) ?? "";
+   blocks.push(
+    `event: content_block_delta\ndata: ${JSON.stringify({
+     type: "content_block_delta",
+     index,
+     delta: { type: "input_json_delta", partial_json: repairToolArguments(name, args, cloak.argSchemas) },
+    })}\n\n`,
+   );
+  }
+  state.messagesArgsByIndex.clear();
+  state.messagesNameByIndex.clear();
+  return blocks.join("");
+ }
+ if (state.chatArgsByIndex.size === 0) return null;
+ const calls: unknown[] = [];
+ for (const [index, args] of state.chatArgsByIndex) {
+  const name = state.chatNameByIndex.get(index);
+  if (name === undefined) continue;
+  calls.push({ index, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
+ }
+ state.chatArgsByIndex.clear();
+ state.chatNameByIndex.clear();
+ if (calls.length === 0) return null;
+ return `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`;
+}
+
+/**
  * True when the stream needs no rewrite and must flow byte-identical:
  * nothing injected, no casing to restore, no find->glob rename, and the
  * caller declared tools. Tool-less callers must still cloak on every path
@@ -388,6 +443,53 @@ function cloakStreamResponsesObject(resp: unknown, cloak: StreamCloakOptions): v
 }
 
 /**
+ * Terminal chunk for chat choice: absorb any tool-call argument fragment
+ * riding the finish_reason chunk into the buffered prefix, then re-emit every
+ * buffered tool call's whole argument packet, repaired.
+ * Returns true if delta was mutated.
+ */
+function flushChatTerminalToolCalls(
+ d: Record<string, unknown>,
+ state: SseStreamCloakState,
+ cloak: StreamCloakOptions,
+ flushedIndices: Set<number>,
+): boolean {
+ if (state.chatArgsByIndex.size === 0) return false;
+
+ for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+  if (!tc || typeof tc !== "object" || Array.isArray(tc)) continue;
+  const rec = tc as Record<string, unknown>;
+  const idx = typeof rec.index === "number" ? rec.index : 0;
+  const fn = rec.function;
+  const fnRec = fn && typeof fn === "object" && !Array.isArray(fn) ? (fn as Record<string, unknown>) : null;
+  if (fnRec && state.chatArgsByIndex.has(idx) && typeof fnRec.arguments === "string") {
+   state.chatArgsByIndex.set(idx, (state.chatArgsByIndex.get(idx) ?? "") + fnRec.arguments);
+  }
+ }
+
+ const flushed: unknown[] = [];
+ for (const [idx, args] of state.chatArgsByIndex) {
+  const name = state.chatNameByIndex.get(idx);
+  if (name === undefined) continue;
+  flushedIndices.add(idx);
+  flushed.push({ index: idx, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
+ }
+ state.chatArgsByIndex.clear();
+ state.chatNameByIndex.clear();
+
+ if (flushed.length === 0) return false;
+
+ const remaining = (Array.isArray(d.tool_calls) ? d.tool_calls : []).filter((tc) => {
+  if (!tc || typeof tc !== "object" || Array.isArray(tc)) return true;
+  const rec = tc as Record<string, unknown>;
+  const idx = typeof rec.index === "number" ? rec.index : 0;
+  return !flushedIndices.has(idx);
+ });
+ d.tool_calls = [...remaining, ...flushed];
+ return true;
+}
+
+/**
  * Rewrite one Chat Completions SSE block: drop injected delta.tool_calls
  * (including nameless argument continuations via per-index tracking), restore
  * surviving names. Tool-less callers lose all tool_calls with arguments
@@ -427,14 +529,6 @@ function rewriteChatBlock(
    continue;
   }
   const d = delta as Record<string, unknown>;
-  if (typeof d.reasoning === "string" && d.reasoning_content === undefined) {
-   d.reasoning_content = d.reasoning;
-   changed = true;
-   allDeltasEmpty = false;
-  }
-  if (d.reasoning_content) {
-   allDeltasEmpty = false;
-  }
   // Terminal chunk for this choice: re-emit every buffered tool call's whole
   // argument packet, repaired. The fragments never went out, so this is the
   // first and only time the client sees them. Runs before the tool_calls
@@ -442,20 +536,8 @@ function rewriteChatBlock(
   // Indices flushed on this block: their arguments are final, so the
   // per-delta loop below must not buffer them a second time.
   const flushedIndices = new Set<number>();
-  if (c.finish_reason && state.chatArgsByIndex.size > 0) {
-   const flushed: unknown[] = [];
-   for (const [idx, args] of state.chatArgsByIndex) {
-    const name = state.chatNameByIndex.get(idx);
-    if (name === undefined) continue;
-    flushedIndices.add(idx);
-    flushed.push({ index: idx, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
-   }
-   state.chatArgsByIndex.clear();
-   state.chatNameByIndex.clear();
-   if (flushed.length > 0) {
-    d.tool_calls = [...(Array.isArray(d.tool_calls) ? d.tool_calls : []), ...flushed];
-    changed = true;
-   }
+  if (c.finish_reason && flushChatTerminalToolCalls(d, state, cloak, flushedIndices)) {
+   changed = true;
   }
   if (!Array.isArray(d.tool_calls)) {
    if (Object.keys(d).length > 0) allDeltasEmpty = false;
@@ -662,7 +744,28 @@ function rewriteMessagesBlock(
    delta: { type: "input_json_delta", partial_json: repairToolArguments(name, buffered, cloak.argSchemas) },
   };
   const stopBlock = emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
-  return `${emitSseBlock("content_block_delta", JSON.stringify(flushed), false)}\n\n${stopBlock}`;
+  return `${emitSseBlock("content_block_delta", JSON.stringify(flushed), true)}\n\n${stopBlock}`;
+ }
+ // A `message` frame carries a whole finished message mid-stream. It needs the
+ // same treatment the aggregate path gives it — injected tool_use dropped,
+ // caller names restored, inputs repaired — otherwise a placeholder call leaks
+ // downstream and a malformed one reaches the host unrepaired. Any block still
+ // buffering arguments is completed first so nothing is orphaned.
+ if (type === "message") {
+  const flushed = flushBufferedToolArgs(state, cloak);
+  cloakMessagesContent(parsed.message ?? parsed, cloak.callerHadTools, cloak.caseRestore, cloak.findGlob, cloak.injected, cloak.argSchemas);
+  if (flushed === null) return emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
+  return `${flushed}${emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix)}`;
+ }
+ // A tool_use block still holding buffered arguments is completed HERE, while
+ // its own event order is intact: `message_delta` / `message_stop` close the
+ // message, so the recovered `input_json_delta` has to precede them. (An
+ // end-of-stream flush would emit it after `message_stop`, where a strict
+ // Anthropic client has already closed the message.)
+ if (type === "message_delta" || type === "message_stop") {
+  const flushed = flushBufferedToolArgs(state, cloak);
+  if (flushed === null) return block;
+  return `${flushed}${emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix)}`;
  }
  return block;
 }
@@ -697,6 +800,15 @@ export interface StreamPipeOptions {
   * Client aborts and clean terminal markers never reach this hook.
   */
  refire?: () => Promise<Readable | null>;
+ /**
+  * Content-type the upstream sent for this response, passed through verbatim.
+  * A value that is present and not an SSE type (text/event-stream) switches
+  * the pipe to byte-for-byte passthrough: no SSE scanner, no synthetic
+  * terminal, no re-fire — a JSON answer or error page on a streaming request
+  * must reach the client exactly as received. Absent, null, or empty means
+  * upstream omitted it; the pipe then classifies the buffered start itself.
+  */
+ upstreamContentType?: string | null;
 }
 /**
  * Pipes an upstream readable stream to a client HTTP response.
@@ -710,6 +822,9 @@ export interface StreamPipeOptions {
  * - Optional `opts.refire`: one silent mid-stream resume on upstream
  *   truncation (see StreamPipeOptions); without it the turn ends with a
  *   synthetic terminal event exactly as before.
+ * - `opts.upstreamContentType` (see StreamPipeOptions): a non-SSE body is
+ *   forwarded byte-for-byte — scanner, synthetic terminals, and re-fire only
+ *   ever apply to real event streams.
  */
 export function pipeUpstreamStream(
  nodeStream: Readable,
@@ -752,6 +867,24 @@ export function pipeUpstreamStream(
  // rewritten and forwarded, so a function_call name split across chunks still
  // matches its injected record.
  let sseBuffer = "";
+ // Byte-to-string join for the buffer: a multi-byte character split
+ // across two TCP chunks must decode as one, never as replacement
+ // characters. `end()` flushes a trailing partial sequence at stream end.
+ let sseDecoder = new StringDecoder("utf8");
+ // Body-kind gate. "sse" runs the event-stream pipeline; "raw" forwards bytes
+ // verbatim (a non-SSE body answered on a streaming request — see
+ // StreamPipeOptions.upstreamContentType); "undecided" (upstream omitted the
+ // content-type) holds a bounded lookahead until SSE proves itself.
+ const upstreamCt = (opts?.upstreamContentType ?? "").trim().toLowerCase();
+ let bodyGate: "sse" | "raw" | "undecided" =
+  upstreamCt === ""
+   ? "undecided"
+   : upstreamCt.includes("text/event-stream")
+    ? "sse"
+    : "raw";
+ // Held lookahead while the gate is undecided, bounded by SNIFF_WINDOW_BYTES.
+ let gateChunks: Buffer[] = [];
+ let gateBytes = 0;
  // Watchdog outcome: recorded exactly once per stream. Client disconnects
  // and proxy-internal aborts set clientAborted first, so the ensure path
  // below skips them and the window only reflects upstream-side results.
@@ -867,12 +1000,48 @@ export function pipeUpstreamStream(
   upstreamEnded = false;
   nodeStream = next;
   sseBuffer = "";
+  sseDecoder = new StringDecoder("utf8");
   terminalScanCarry = Buffer.alloc(0);
   watch(next);
   try {
    if (!cut.destroyed) cut.destroy();
   } catch { }
   log("debug", "mid-stream model-fault refire: continuing turn on replacement stream", { totalChunks, totalBytes }, rid);
+ };
+ /**
+  * Write one payload to the client with the shared backpressure/flush
+  * handling, so the SSE and raw paths keep identical delivery guarantees.
+  */
+ const deliver = (data: string | Buffer): void => {
+  const canContinue = res.write(data);
+  if (canContinue === false && !nodeStream.destroyed) {
+   nodeStream.pause();
+   const onDrain = () => {
+    res.off("drain", onDrain);
+    if (!nodeStream.destroyed) nodeStream.resume();
+   };
+   res.once("drain", onDrain);
+  }
+  const maybeFlush = res as unknown as { flush?: () => void };
+  if (typeof maybeFlush.flush === "function") {
+   maybeFlush.flush();
+  }
+ };
+ /**
+  * Verbatim passthrough for a non-SSE body: the exact bytes upstream sent —
+  * no scanner, no synthetic terminal, no re-fire (a complete document, not an
+  * event stream).
+  */
+ const forwardRaw = (chunk: Buffer): void => {
+  lastForwardedByteAt = Date.now();
+  deliver(chunk);
+ };
+ /** Release the held lookahead into the raw path and close the gate. */
+ const flushGateRaw = (): void => {
+  const held = gateChunks;
+  gateChunks = [];
+  gateBytes = 0;
+  for (const buffered of held) forwardRaw(buffered);
  };
  /**
   * Forward one rewritten SSE block: terminal-marker scan plus the shared
@@ -895,19 +1064,7 @@ export function pipeUpstreamStream(
    hasTerminalEvent = true;
   }
   terminalScanCarry = Buffer.from(scanBuf.subarray(Math.max(0, scanBuf.length - 32)));
-  const canContinue = res.write(text);
-  if (canContinue === false && !nodeStream.destroyed) {
-   nodeStream.pause();
-   const onDrain = () => {
-    res.off("drain", onDrain);
-    if (!nodeStream.destroyed) nodeStream.resume();
-   };
-   res.once("drain", onDrain);
-  }
-  const maybeFlush = res as unknown as { flush?: () => void };
-  if (typeof maybeFlush.flush === "function") {
-   maybeFlush.flush();
-  }
+  deliver(text);
  };
  const sseBoundary = /\r?\n\r?\n/;
  const ensureTerminalEvent = (
@@ -984,6 +1141,7 @@ export function pipeUpstreamStream(
   upstreamEnded = false;
   nodeStream = next;
   sseBuffer = "";
+  sseDecoder = new StringDecoder("utf8");
   terminalScanCarry = Buffer.alloc(0);
   watch(next);
   log("debug", "mid-stream refire: continuing turn on replacement stream", { totalChunks, totalBytes }, rid);
@@ -995,6 +1153,49 @@ export function pipeUpstreamStream(
    res.flushHeaders();
   }
  } catch { }
+ /**
+  * SSE pipeline for one received chunk: thinking sniff plus the
+  * double-newline block scanner. Only reached once the body is known to be
+  * an event stream (upstream content-type, or sniffed `data:`/`event:`
+  * evidence).
+  */
+ const processSseChunk = (chunk: Buffer | string): void => {
+  const chunkSize =
+   typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.length;
+  if (sniffThinking(chunk)) {
+   thinkingChunks++;
+   thinkingBytes += chunkSize;
+   if (isDebugEnabled() && thinkingChunks <= 3) {
+    const preview =
+     typeof chunk === "string"
+      ? chunk.slice(0, 600)
+      : chunk.toString("utf8", 0, 600);
+    log(
+     "debug",
+     `thinking chunk #${thinkingChunks}`,
+     { preview: preview.slice(0, 400) },
+     rid,
+    );
+   }
+  }
+  // Buffer across chunks into complete SSE blocks delimited by double-newline.
+  // Forwarding only complete blocks guarantees that network chunk boundaries
+  // never split JSON strings on the wire or leave unterminated syntax when
+  // mid-stream refire or truncation occurs.
+  sseBuffer += typeof chunk === "string" ? chunk : sseDecoder.write(chunk);
+  let boundary = sseBoundary.exec(sseBuffer);
+  while (boundary) {
+   const block = sseBuffer.slice(0, boundary.index);
+   sseBuffer = sseBuffer.slice(boundary.index + boundary[0].length);
+   if (cloakState && cloak) {
+    const rewritten = rewriteSseBlock(block, cloakState, cloak);
+    if (rewritten !== null) forwardText(`${rewritten}\n\n`);
+   } else {
+    forwardText(`${block}\n\n`);
+   }
+   boundary = sseBoundary.exec(sseBuffer);
+  }
+ };
  const onData = (chunk: Buffer | string): void => {
   try {
    // While a replacement stream is being fetched the cut stream is stale:
@@ -1011,39 +1212,33 @@ export function pipeUpstreamStream(
    totalBytes += chunkSize;
    lastForwardedByteAt = Date.now();
 
-   if (sniffThinking(chunk)) {
-    thinkingChunks++;
-    thinkingBytes += chunkSize;
-    if (isDebugEnabled() && thinkingChunks <= 3) {
-     const preview =
-      typeof chunk === "string"
-       ? chunk.slice(0, 600)
-       : chunk.toString("utf8", 0, 600);
-     log(
-      "debug",
-      `thinking chunk #${thinkingChunks}`,
-      { preview: preview.slice(0, 400) },
-      rid,
-     );
+   if (bodyGate === "undecided") {
+    // Upstream sent no content-type: classify the body from its start. SSE
+    // evidence switches to the normal pipeline and replays the held
+    // lookahead into it; the bounded window filling with no evidence
+    // classifies the body as raw passthrough.
+    const buf = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+    gateChunks.push(buf);
+    gateBytes += buf.length;
+    const isSse = SSE_START_RE.test(Buffer.concat(gateChunks, gateBytes).toString("utf8"));
+    if (!isSse && gateBytes < SNIFF_WINDOW_BYTES) return;
+    if (!isSse) {
+     bodyGate = "raw";
+     flushGateRaw();
+     return;
     }
+    bodyGate = "sse";
+    const held = gateChunks;
+    gateChunks = [];
+    gateBytes = 0;
+    for (const buffered of held) processSseChunk(buffered);
+    return;
    }
-   // Buffer across chunks into complete SSE blocks delimited by double-newline.
-   // Forwarding only complete blocks guarantees that network chunk boundaries
-   // never split JSON strings on the wire or leave unterminated syntax when
-   // mid-stream refire or truncation occurs.
-   sseBuffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
-   let boundary = sseBoundary.exec(sseBuffer);
-   while (boundary) {
-    const block = sseBuffer.slice(0, boundary.index);
-    sseBuffer = sseBuffer.slice(boundary.index + boundary[0].length);
-    if (cloakState && cloak) {
-     const rewritten = rewriteSseBlock(block, cloakState, cloak);
-     if (rewritten !== null) forwardText(`${rewritten}\n\n`);
-    } else {
-     forwardText(`${block}\n\n`);
-    }
-    boundary = sseBoundary.exec(sseBuffer);
+   if (bodyGate === "raw") {
+    forwardRaw(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+    return;
    }
+   processSseChunk(chunk);
   } catch { }
  };
 
@@ -1071,6 +1266,16 @@ export function pipeUpstreamStream(
   try {
    if (!res.headersSent) {
     res.writeHead(502, { "content-type": "application/json" });
+   } else if (bodyGate !== "sse") {
+    // Non-SSE passthrough: no event-stream contract to terminate — release
+    // the held lookahead and end without a synthetic terminal. A genuine
+    // upstream-side failure still marks the relay exactly like the SSE
+    // truncation path, so health keeps attributing cut streams.
+    flushGateRaw();
+    if (!isInternalAbort && relayUrl && relayUrl !== "direct") {
+     midStreamRelayTruncations += 1;
+     markRelayFailure(relayUrl, 0, errorMsg || "stream failed mid-body");
+    }
    } else if (isInternalAbort) {
     clientAborted = true;
     sseBuffer = "";
@@ -1093,6 +1298,29 @@ export function pipeUpstreamStream(
   // must neither inject a terminal nor end res mid-rescue.
   if (refirePending) return;
   upstreamEnded = true;
+  if (bodyGate !== "sse") {
+   // Non-SSE passthrough ("undecided" here means upstream sent no
+   // content-type and no SSE field line ever appeared): the held lookahead
+   // is the tail of a complete non-SSE body — flush it verbatim, then end.
+   // No synthetic terminal, no re-fire, no watchdog sample: this was never
+   // an event stream.
+   try {
+    flushGateRaw();
+   } catch { }
+   try {
+    if (!res.writableEnded) res.end();
+   } catch { }
+   log(
+    "debug",
+    `non-SSE upstream body passed through verbatim — ${totalChunks} chunks (${(totalBytes / 1024).toFixed(1)}KB)`,
+    undefined,
+    rid,
+   );
+   return;
+  }
+  // The final chunk may end mid-character: only the decoder knows whether
+  // bytes are still pending, and those bytes are part of the last block.
+  sseBuffer += sseDecoder.end();
   // Cloaked streams hold the trailing incomplete block: flush it (rewritten)
   // ahead of the terminal-marker check so a coalesced final event still counts.
   if (sseBuffer.trim() !== "") {
@@ -1107,6 +1335,15 @@ export function pipeUpstreamStream(
     }
    }
   }
+ // Buffered tool arguments are released on the call's terminal event, which a
+ // cut stream never sends. Flush them here: the client already saw the call
+ // announced, so it must receive the arguments too rather than a name with no
+ // payload. Runs before the terminal-marker decision and before the re-fire
+ // offer, because a rescue regenerates the turn and would double the calls.
+ if (cloakState && cloak) {
+  const flushed = flushBufferedToolArgs(cloakState, cloak);
+  if (flushed !== null) forwardText(flushed);
+ }
   if (hasTerminalEvent) recordOnce(false);
   const elapsed = ((Date.now() - startAt) / 1000).toFixed(1);
   if (!hasTerminalEvent && totalChunks > 0) {
@@ -1148,7 +1385,24 @@ export function pipeUpstreamStream(
   // inject a terminal nor end res — the replacement stream owns the turn now.
   if (refirePending) return;
   try {
-   if (!hasTerminalEvent && totalChunks > 0) {
+  // Same obligation as the clean-end flush: the client already saw the call
+  // announced, so its buffered arguments must still arrive before the turn is
+  // terminated — and before the re-fire offer, since a rescue regenerates the
+  // turn and would double the calls.
+  if (cloakState && cloak) {
+   const flushed = flushBufferedToolArgs(cloakState, cloak);
+   if (flushed !== null) forwardText(flushed);
+  }
+   if (bodyGate !== "sse") {
+    // Non-SSE passthrough: same relay-fault accounting as the SSE path's
+    // mid-body close (a genuine upstream socket death, not a client
+    // disconnect), but no terminal is owed on raw bytes.
+    flushGateRaw();
+    if (!clientAborted && !upstreamEnded && relayUrl && relayUrl !== "direct") {
+     midStreamRelayTruncations += 1;
+     markRelayFailure(relayUrl, 0, "stream closed prematurely");
+    }
+   } else if (!hasTerminalEvent && totalChunks > 0) {
     if (clientAborted || upstreamEnded) {
      // Client disconnect teardown or post-end cleanup — the relay
      // is not at fault; still give the host a terminal event.

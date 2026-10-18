@@ -1,7 +1,7 @@
 /**
  * Dynamic catalog discovery, caching, and model enrichment for pi-freeflow
  *
- * Provides 1-hour atomic disk caching with safe offline fallback to verified static definitions.
+ * Provides 24-hour atomic disk caching with safe offline fallback to verified static definitions.
  */
 
 import { randomUUID } from "node:crypto";
@@ -11,7 +11,6 @@ import {
  CATALOG_CACHE_FILE,
  CATALOG_CACHE_TTL_MS,
  CATALOG_REFRESH_TIMEOUT_MS,
- KILO_CHAT_URL,
  OPENCODE_API_URL,
  opencodeHeaders,
 } from "./config.ts";
@@ -44,8 +43,14 @@ import type {
  * - inclusionai/ling-3.0-flash-fin:free: gone from Kilo (2026-10-01) — keyless chat 404
  *   "The requested model ... does not exist".
  * - mimo-v2.5-free: decommissioned upstream (2026-10-07) — HTTP 401 "Model mimo-v2.5-free is not supported".
- * - exo-free: deprecated upstream (2026-10-09) — HTTP 410 "Model exo-free has
- *   been deprecated." (was 503 "Endpoint is unavailable" on 2026-10-07).
+ *   Re-probed 2026-10-16: 410 "Model mimo-v2.5-free has been deprecated. Use
+ *   mimo-v2.6-flash-free instead." The docs still list it as free; they are stale.
+ * - exo-free: dead-listed 2026-10-09 (410 "Model exo-free has been deprecated")
+ *   but revived upstream on 2026-10-16 — back on the official free lineup and
+ *   answering live through the proxy (chat 200 with tools, stream, reasoning,
+ *   vision; dual-canary recall at ~520K tokens; a 1.2M-word prompt draws the
+ *   empty-bodied 400). Re-registered statically the same day: do NOT add this
+ *   id back to this set unless it dies again.
  * - fledge-alpha-free: withdrawn upstream (2026-10-09) — absent from the live
  *   Zen list, chat 401 "Model fledge-alpha-free is not supported".
  * - inclusionai/ling-3.0-flash-sante:free: demoted to paid on Kilo (2026-10-09) —
@@ -66,6 +71,15 @@ import type {
  *   and responses from LLMs", not a chat model. Same exclusion class as
  *   jev-1.13-free: live, wrong shape for an agentic harness, so it must never
  *   re-enter the picker via disk cache or upstream merge.
+ * - cline-free/deepseek-v4.1-flash, cline-free/kimi-k3, cline-free/solar-pro4:
+ *   retired upstream (2026-10-13) — probed live twice each against the real
+ *   Cline pool, every attempt answered HTTP 404 `{"error":"model not found",
+ *   "success":false,"hint":"Cline has no such model. Refresh the model list and
+ *   retry."}`, while the two Cline models that survive (cline-free/
+ *   muse-spark-1.3-contributor and z-ai/glm-5.3-flash) answered 200 with the
+ *   same account and request shape. The lane is healthy; these three ids are
+ *   gone, so they must never re-enter the picker from disk cache or an
+ *   upstream merge.
  */
 export const DEAD_MODEL_IDS = new Set<string>([
  "jev-1.13-free",
@@ -86,13 +100,36 @@ export const DEAD_MODEL_IDS = new Set<string>([
  "ling-3.0-flash-fin-free",
  "inclusionai/ling-3.0-flash-fin:free",
  "mimo-v2.5-free",
- "exo-free",
  "stealth/space-bunny-alpha",
  "qwen/qwen3.8-27b:free",
  "nvidia/nemotron-3.5-content-safety:free",
  "fledge-alpha-free",
  "inclusionai/ling-3.0-flash-sante:free",
  "stepfun/step-3.7-flash:free",
+ "cline-free/deepseek-v4.1-flash",
+ "cline-free/kimi-k3",
+ "cline-free/solar-pro4",
+ // ling-3.1-flash-free: removed from upstream free docs (2026-10-15).
+ "ling-3.1-flash-free",
+ // inclusionai/ling-3.1-flash: demoted to paid on Kilo (2026-10-15) — answers 401 PAID_MODEL_AUTH_REQUIRED.
+ "inclusionai/ling-3.1-flash",
+ // ovh-free/Mistral-7B-Instruct-v0.3: removed upstream by OVH (2026-10-15) — answers 404 no route matched.
+ "ovh-free/Mistral-7B-Instruct-v0.3",
+ // step-5-preview-free: removed from the Zen free docs (2026-10-16 drift,
+ // v1.19.2) and the endpoint answers 400 "Model is unavailable" on both the
+ // chat and the responses shape — the same retirement signature as
+ // deepseek-v4-flash-free.
+ "step-5-preview-free",
+ // stepfun/step-5-preview-free: demoted to paid on Kilo (2026-10-16) —
+ // answers 401 PAID_MODEL_AUTH_REQUIRED while the sibling z-ai/glm-5.3-flash
+ // answers 200 keyless with the same request shape.
+ "stepfun/step-5-preview-free",
+ // ll-alpha-free: decommissioned upstream (2026-10-17) — gone from live
+ // Zen /v1/models list, answers HTTP 410 "Model ll-alpha-free has been deprecated".
+ "ll-alpha-free",
+ // muse-spark-1.3-contributor-free: decommissioned upstream (2026-10-17) — gone from
+ // live Zen /v1/models list, answers HTTP 410 "Model muse-spark-1.3-contributor-free has been deprecated".
+ "muse-spark-1.3-contributor-free",
 ]);
 /**
  * Free-tier allowlist for anything entering the picker via network or stale disk.
@@ -132,7 +169,7 @@ export function sanitizeCatalogModels(models: RegisteredModel[]): RegisteredMode
 }
 /**
  * In-memory cache of currently active/available free models.
- * Initialized with all 30 verified models for 0ms instant availability.
+ * Initialized with all 36 verified models for 0ms instant availability.
  */
 let aliveCatalog: RegisteredModel[] = ALL_MODELS.map((m) => ({
  ...m,
@@ -335,7 +372,10 @@ export function writeCatalogCache(data: CatalogCacheData): void {
 }
 
 /**
- * Refresh free model catalog from OpenCode Zen and KiloCode Gateway endpoints.
+ * Refresh the free model catalog from the OpenCode Zen listing. Only Zen is
+ * fetched — Kilo ids stay static (merged from ALL_MODELS; the cache's kilo
+ * field is preserved but never re-fetched), so Kilo entries change only in
+ * src/models.ts.
  * Uses ETag conditional requests (If-None-Match) to avoid re-merging unchanged
  * catalogs; a 304 Not Modified response skips merge and returns the in-memory
  * catalog unchanged. Falls back gracefully to cached or static models if network

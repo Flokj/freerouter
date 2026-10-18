@@ -1,7 +1,8 @@
 /**
  * Persistent relay state manager and failover ordering for pi-freeflow
  *
- * Handles atomic state writes to ~/.pi/agent/pi-freeflow-relay-state.json.
+ * Handles atomic state writes to pi's agent dir (PI_CODING_AGENT_DIR,
+ * default ~/.pi/agent) under pi-freeflow-relay-state.json.
  */
 
 import { randomUUID } from "node:crypto";
@@ -138,8 +139,9 @@ function parseRelayState(raw: string): RelayState | null {
       : s?.enabled !== false && relays.length > 0,
    url: typeof s?.url === "string" ? s.url.trim() : (relays[0]?.url || ""),
    relays,
-   hideWidget: s?.hideWidget === true,
-  };
+			hideWidget: s?.hideWidget === true,
+			autoUpdate: s?.autoUpdate === true,
+		};
  } catch {
   return null;
  }
@@ -204,7 +206,7 @@ export function loadRelayState(): RelayState {
    if (healed) {
     return healed;
    }
-   return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: false };
+			return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: false, autoUpdate: false };
   }
   const raw = fs.readFileSync(RELAY_STATE_FILE, "utf8");
   const main = parseRelayState(raw);
@@ -221,13 +223,16 @@ export function loadRelayState(): RelayState {
   });
   // parse returns null on an empty pool by design (wipe-protection above);
   // preserve an explicit hide so hide-with-zero-relays survives reload.
-  let hide = false;
-  try {
-   hide = (JSON.parse(raw) as RelayState)?.hideWidget === true;
-  } catch { }
-  return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: hide };
- } catch {
-  return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: false };
+		let hide = false;
+		let autoUpdate = false;
+		try {
+			const parsed = JSON.parse(raw) as RelayState;
+			hide = parsed?.hideWidget === true;
+			autoUpdate = parsed?.autoUpdate === true;
+		} catch {}
+		return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: hide, autoUpdate };
+	} catch {
+		return { mode: "auto", enabled: true, url: "", relays: [], hideWidget: false, autoUpdate: false };
  }
 }
 
@@ -263,7 +268,7 @@ export function saveRelayState(s: RelayState): void {
 
 /** Block synchronously for ms without burning CPU. */
 function sleepSync(ms: number): void {
- Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, Date.now() + ms);
+ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 /**
