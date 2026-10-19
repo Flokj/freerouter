@@ -11,7 +11,8 @@
 import { startProxy } from "./src/proxy.ts";
 import { setAliveCatalog, refreshCatalog, getAliveCatalog } from "./src/catalog.ts";
 import { ALL_MODELS, getModelUpstream } from "./src/models.ts";
-import { HOST, PORT } from "./src/config.ts";
+import { HOST, PORT, resolveTokenPath } from "./src/config.ts";
+import { readToken } from "./src/token.ts";
 
 const bindPort = Number(process.env.PORT || PORT || 28180);
 
@@ -33,11 +34,19 @@ if (!server) {
 // Keep server running permanently
 server.ref();
 
+// The per-installation token (created by startProxy) is the only API key the
+// proxy accepts. Print it once so standalone users can configure their agents
+// without hunting through the data directory.
+const token = readToken() ?? "";
+const tokenPath = resolveTokenPath();
+
 console.log(`=======================================================`);
 console.log(`  FreeFlow Proxy is active and running!`);
 console.log(`  Port: http://${HOST}:${port}/v1`);
 console.log(`  Health: http://${HOST}:${port}/_health`);
 console.log(`  Models: http://${HOST}:${port}/v1/models`);
+console.log(`  Token (API key): ${token || "<none — not writable>"}`);
+console.log(`  Token file: ${tokenPath}`);
 console.log(`=======================================================`);
 
 // Background live catalog refresh
