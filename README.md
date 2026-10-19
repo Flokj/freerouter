@@ -9,7 +9,7 @@ Nothing leaves your machine except the requests themselves to the free upstreams
 
 This is a standalone fork: it tracks the shared proxy core of
 [`trefeon/pi-freeflow`](https://github.com/trefeon/pi-freeflow) (synced to
-**v1.38.5** / `b09151d`) and drops the Pi/OMP extension layer, so it runs on its
+**v1.38.5** / `7427771`) and drops the Pi/OMP extension layer, so it runs on its
 own without a host.
 
 ## Requirements
@@ -55,25 +55,35 @@ PORT=28999 npm start
 | `POST` | `/v1/messages` | Anthropic Messages (translated) |
 | `GET`  | `/_health` | server status (loopback-only) |
 
-Any authorization key is accepted — the server does not check it. Use `freeflow`
-for consistency:
+On first start the server creates a per-installation access token and writes it
+to `~/.pi/agent/token` (mode 0600). Every `/v1/*` and `/_*` request must carry
+it as the bearer key — the server answers `401` without it. Only `GET /health`
+stays open (liveness probes). The startup banner prints the token and its file
+path.
 
+```bash
+TOKEN=$(cat ~/.pi/agent/token)   # the per-installation API key
 ```
-Authorization: Bearer ***
+
+```text
+Authorization: Bearer <token>
 ```
 
 Quick check:
 
 ```bash
+TOKEN=$(cat ~/.pi/agent/token)
 curl http://127.0.0.1:28180/v1/chat/completions \
   -H 'content-type: application/json' \
-  -H 'authorization: Bearer ***' \
+  -H "authorization: Bearer $TOKEN" \
   -d '{"model":"big-pickle","messages":[{"role":"user","content":"Say OK"}]}'
 ```
 
 ## Connecting agents
 
-In every case: **Base URL** = `http://127.0.0.1:28180/v1`, **API key** = `freeflow`.
+In every case: **Base URL** = `http://127.0.0.1:28180/v1`, **API key** = the
+token from `~/.pi/agent/token` (a 64-character hex string, printed in the
+startup banner).
 
 ### Jin
 
@@ -85,14 +95,14 @@ In the TUI:
 2. **Kind**: `openai`
 3. **Name**: `freeflow`
 4. **Base URL**: `http://127.0.0.1:28180/v1`
-5. **API Key**: `freeflow`
+5. **API Key**: the value from `~/.pi/agent/token`
 6. Pick a model with `/model`
 
 In headless mode:
 
 ```bash
 JIN_BASE_URL="http://127.0.0.1:28180/v1" \
-JIN_API_KEY="freeflow" \
+JIN_API_KEY="$(cat ~/.pi/agent/token)" \
 JIN_PROVIDER_KIND="openai" \
 JIN_MODEL="nemotron-3.5-lightning-free" \
 jin -p "Your prompt"
@@ -106,7 +116,7 @@ INSERT OR REPLACE INTO settings (key, value) VALUES
 ('providers', json_insert(
   COALESCE((SELECT value FROM settings WHERE key='providers'), '[]'),
   '\$[#]',
-  json('{\"id\":\"freeflow\",\"name\":\"FreeFlow\",\"kind\":\"openai\",\"base_url\":\"http://127.0.0.1:28180/v1\",\"api_key\":\"freeflow\"}')
+  json('{"id":"freeflow","name":"FreeFlow","kind":"openai","base_url":"http://127.0.0.1:28180/v1","api_key":"<token from ~/.pi/agent/token>"}')
 ));
 "
 ```
@@ -133,7 +143,7 @@ In the Pi provider config:
 {
   "name": "freeflow",
   "base_url": "http://127.0.0.1:28180/v1",
-  "api_key": "freeflow",
+  "api_key": "<token from ~/.pi/agent/token>",
   "models": ["big-pickle", "nemotron-3.5-lightning-free"]
 }
 ```
@@ -144,7 +154,7 @@ Environment variables:
 
 ```bash
 export HERMES_BASE_URL="http://127.0.0.1:28180/v1"
-export HERMES_API_KEY="freeflow"
+export HERMES_API_KEY="$(cat ~/.pi/agent/token)"
 export HERMES_MODEL="big-pickle"
 ```
 
@@ -152,7 +162,7 @@ export HERMES_MODEL="big-pickle"
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:28180/v1"
-export OPENAI_API_KEY="freeflow"
+export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 ```
 
 ## Models
@@ -258,6 +268,10 @@ Short names for convenience (an optional `:effort` suffix — `:low`, `:high`,
 ## What the proxy does
 
 More than forwarding requests:
+
+- **Token authorization** — the loopback proxy requires its own per-installation
+  bearer token (written to `~/.pi/agent/token`), so other local processes or
+  web pages cannot use your free quota. Loopback Host checks included.
 
 - **OpenCode client fingerprinting** — the Zen `/inference` endpoint requires
   `opencode/<version>`, `x-session-id`, a `public` bearer token and other client
