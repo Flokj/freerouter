@@ -1,6 +1,6 @@
 # FreeFlow Proxy
 
-A local OpenAI-compatible proxy server. It exposes **36 free models** (OpenCode
+A local OpenAI-compatible proxy server. It exposes **35 free models** (OpenCode
 Zen, KiloCode Gateway, Cline, OVHcloud AI Endpoints) through a standard API on
 `127.0.0.1:28180`, so any coding agent can use them: Jin, Codex, Pi, Hermes,
 Aider, Continue, and others.
@@ -9,8 +9,8 @@ Nothing leaves your machine except the requests themselves to the free upstreams
 
 This is a standalone fork: it tracks the shared proxy core of
 [`trefeon/pi-freeflow`](https://github.com/trefeon/pi-freeflow) (synced to
-**v1.38.4**) and drops the Pi/OMP extension layer, so it runs on its own without
-a host.
+**v1.38.5** / `b09151d`) and drops the Pi/OMP extension layer, so it runs on its
+own without a host.
 
 ## Requirements
 
@@ -29,8 +29,8 @@ npm start
 The server comes up on `http://127.0.0.1:28180/v1`:
 
 ```
-[freeflow-proxy] Initializing with 36 models...
-[freeflow-proxy] Catalog refreshed: 36 models verified
+[freeflow-proxy] Initializing with 35 models...
+[freeflow-proxy] Catalog refreshed: 35 models verified
 =======================================================
   FreeFlow Proxy is active and running!
   Port: http://127.0.0.1:28180/v1
@@ -157,16 +157,15 @@ export OPENAI_API_KEY="freeflow"
 
 ## Models
 
-36 models, with context windows up to 1M tokens. The full list is at
+35 models, with context windows up to 1M tokens. The full list is at
 `GET /v1/models`. The tables below are generated from `src/models.ts`
 (`scripts/gen-readme.mjs`), so they stay accurate.
 
-### OpenCode Zen (13 models)
+### OpenCode Zen (12 models)
 
 | ID | Context | Max output | API | Thinking | Vision |
 |---|---|---|---|---|---|
 | `cat-jam-free` | 256K (262,144) | 128K (131,072) | chat | low,medium,high,xhigh,max | ❌ |
-| `muse-spark-1.2-contributor-free` | 1M (1,048,576) | 128K (131,072) | responses | minimal,low,medium,high,xhigh | ✅ |
 | `mimo-v2.6-flash-free` | 1M (1,048,576) | 128K (131,072) | chat | minimal,low,medium,high,xhigh | ✅ |
 | `nemotron-3-ultra-free` | 1M (1,000,000) | 128K (128,000) | chat | minimal,low,medium,high,xhigh | ❌ |
 | `nemotron-3.5-lightning-free` | 1M (1,000,000) | 256K (262,144) | chat | minimal,low,medium,high,xhigh | ❌ |
@@ -218,7 +217,7 @@ export OPENAI_API_KEY="freeflow"
 | `ovh-free/Meta-Llama-3_3-70B-Instruct` | 128K (131,072) | 16K (16,384) | chat |
 
 Cline models draw from a per-user pool of tokens. Until an account is added they
-answer `401 cline_pool_exhausted`. The other 34 models work without
+answer `401 cline_pool_exhausted`. The other 33 models work without
 authentication.
 
 ### Aliases
@@ -282,7 +281,7 @@ More than forwarding requests:
 
 - **Daily quotas.** Upstreams rate-limit requests per IP. Once exhausted a model
   answers `429` — that is not a proxy failure, try another model.
-- **Cline** requires your own account (see above). The other 34 models are keyless.
+- **Cline** requires your own account (see above). The other 33 models are keyless.
 - **Slow models.** Some models (reasoning ones) spend many tokens thinking. If a
   reply comes back empty, raise `max_tokens`.
 
@@ -291,7 +290,7 @@ More than forwarding requests:
 ```bash
 npm install
 npm run check      # typecheck + tests
-npm test           # 679 tests, network-free
+npm test           # 680 tests, network-free
 npm run typecheck
 ```
 
@@ -314,7 +313,7 @@ Layout:
 ```
 server.ts                entry point
 src/proxy.ts             HTTP server and routing
-src/models.ts            catalog of the 36 models
+src/models.ts            catalog of the 35 models
 src/catalog.ts           live catalog verification
 src/config.ts            upstream endpoints, fingerprint, paths
 src/tool-translation.ts  tool translation between APIs
