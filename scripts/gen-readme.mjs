@@ -10,13 +10,11 @@ import {
 const nf = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 const fmt = (n) => {
  if (n == null) return "—";
- let label;
- if (n % 1_000_000 === 0) label = `${n / 1_000_000}M`;
- else if (n % 1_048_576 === 0) label = `${n / 1_048_576}M`;
- else if (n % 1_000 === 0) label = `${n / 1_000}K`;
- else if (n % 1_024 === 0) label = `${n / 1_024}K`;
- else label = nf(n);
- return `${label} (${nf(n)})`;
+ if (n % 1_000_000 === 0) return `${n / 1_000_000}M (${nf(n)})`;
+ if (n % 1_048_576 === 0) return `${n / 1_048_576}M (${nf(n)})`;
+ if (n % 1_000 === 0) return `${n / 1_000}K (${nf(n)})`;
+ if (n % 1_024 === 0) return `${n / 1_024}K (${nf(n)})`;
+ return nf(n);
 };
 
 const levels = (m) => {
