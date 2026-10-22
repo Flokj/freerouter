@@ -9,7 +9,7 @@ Nothing leaves your machine except the requests themselves to the free upstreams
 
 This is a standalone fork: it tracks the shared proxy core of
 [`trefeon/pi-freeflow`](https://github.com/trefeon/pi-freeflow) (synced to
-**v1.40.0** / `6a5a842`) and drops the Pi/OMP extension layer, so it runs on its
+**v1.40.1** / `92532c3`) and drops the Pi/OMP extension layer, so it runs on its
 own without a host.
 
 ## Requirements
