@@ -368,6 +368,48 @@ test("sseToChatCompletionJson: one call split across deltas still reassembles wh
 	assert.deepEqual(JSON.parse(calls[0].function.arguments), { command: "ls" });
 });
 
+test("sseToChatCompletionJson: a restated name on the arguments frame replaces, never appends", () => {
+	// Observed live from OpenCode Zen on 2026-10-22: the gateway streams one
+	// tool call as TWO frames that both carry the complete name — a name-only
+	// frame, then a frame repeating that name with the arguments. Appending
+	// accumulated `get_weatherget_weather`, a tool name no declaration matches,
+	// which streamed hosts papered over (they bind by index) and non-stream
+	// callers did not.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","function":{"name":"get_weather"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Tokyo\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 1, "the repeat header must not open a second call");
+	assert.equal(calls[0].function.name, "get_weather", "the restated name is authoritative, not appended");
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" }, "arguments intact");
+});
+
+test("sseToChatCompletionJson: a name split across deltas still reassembles", () => {
+	// The ordinary piecewise shape: name-only deltas carry the next slice of
+	// the name and must keep appending, so the replace-on-arguments rule above
+	// never truncates a streamed name to its last fragment.
+	const sse = [
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_w","type":"function","function":{"name":"get_"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"weather"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"city\\":\\"Tokyo\\"}"}}]}}]}',
+		'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
+		"data: [DONE]",
+	].join("\n\n");
+	const res = sseToChatCompletionJson(sse, true) as {
+		choices: Array<{ message: { tool_calls: Array<{ function: { name: string; arguments: string } }> } }>;
+	};
+	const calls = res.choices[0].message.tool_calls;
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].function.name, "get_weather", "name fragments append in order");
+	assert.deepEqual(JSON.parse(calls[0].function.arguments), { city: "Tokyo" });
+});
+
 test("sseToChatCompletionJson: id-less streams still split on distinct indices", () => {
 	// Providers that send no id at all keep working through the index fallback.
 	const sse = [
@@ -525,7 +567,7 @@ test("normalizeResponsesBody: every assistant commentary item loses its phase", 
 	assert.equal(twoTurnItems[2].phase, "final_answer", "final_answer is not the rejected shape");
 });
 
-test("tool_choice is auto-or-absent on every Zen path", () => {
+test("tool_choice is auto-or-absent on Zen chat/responses; the messages lane keeps its own semantics", () => {
 	const unsupported = ["none", "required", "any"] as const;
 	for (const value of unsupported) {
 		const body: Record<string, unknown> = { model: "nemotron-3.5-super-vl-free", input: "hi", tool_choice: value };
@@ -560,15 +602,83 @@ test("tool_choice is auto-or-absent on every Zen path", () => {
 	enforceOpencodeFingerprint(chatAuto, "/v1/chat/completions");
 	assert.equal(chatAuto.tool_choice, "auto", "chat auto rides verbatim");
 
-	// The messages path shares the chat branch: Zen accepts only auto there
-	// too, so an unsupported choice is dropped rather than passed through.
-	const messagesPath: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "required" };
-	enforceOpencodeFingerprint(messagesPath, "/v1/messages");
-	assert.ok(!("tool_choice" in messagesPath), "messages path drops an unsupported choice too");
+	// The Zen messages lane keeps its own choice semantics: Anthropic names
+	// choices with `any` / `{ type: "tool", name: ... }`, and the chat drop
+	// would delete them. Nothing is rewritten there, byte-identical.
+	const messagesRequired: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "required" };
+	enforceOpencodeFingerprint(messagesRequired, "/v1/messages");
+	assert.equal(messagesRequired.tool_choice, "required", "messages keeps an unsupported chat-lane choice untouched");
+
+	const messagesAny: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "any" };
+	enforceOpencodeFingerprint(messagesAny, "/v1/messages");
+	assert.equal(messagesAny.tool_choice, "any", "messages keeps the Anthropic any-choice");
+
+	const messagesNamed: Record<string, unknown> = {
+		model: "claude-fable-5",
+		messages: [],
+		tool_choice: { type: "tool", name: "bash" },
+	};
+	enforceOpencodeFingerprint(messagesNamed, "/v1/messages");
+	assert.deepEqual(messagesNamed.tool_choice, { type: "tool", name: "bash" }, "messages keeps a named Anthropic choice");
 
 	const messagesAuto: Record<string, unknown> = { model: "claude-fable-5", messages: [], tool_choice: "auto" };
 	enforceOpencodeFingerprint(messagesAuto, "/v1/messages");
 	assert.equal(messagesAuto.tool_choice, "auto", "messages auto rides verbatim");
+});
+
+test("enforceOpencodeFingerprint: the chat lane clamps a flat reasoning_effort like the responses lane", () => {
+	// cat-jam-free: `minimal` is not an offered rung — the live gateway
+	// enumerates max/xhigh/high/medium/low only (issue #62). The chat lane
+	// must run the same clampedEffortFor algorithm normalizeResponsesBody
+	// runs on the responses lane, so an unsupported flat effort clamps to the
+	// model's highest supported rung instead of 400ing upstream.
+	const clamp: Record<string, unknown> = {
+		model: "cat-jam-free",
+		messages: [],
+		reasoning_effort: "minimal",
+	};
+	enforceOpencodeFingerprint(clamp, "/v1/chat/completions");
+	assert.equal(clamp.reasoning_effort, "max", "unsupported flat effort clamped to the highest supported rung");
+
+	// The camelCase spelling gets the identical treatment.
+	const camel: Record<string, unknown> = {
+		model: "nemotron-3.5-super-vl-free",
+		reasoningEffort: "max",
+	};
+	enforceOpencodeFingerprint(camel, "/v1/chat/completions");
+	assert.equal(camel.reasoningEffort, "xhigh", "unsupported camelCase effort clamped too");
+
+	// A supported rung, a genuine off, and a key the map does not know all
+	// ride byte-identical, matching normalizeResponsesBody semantics.
+	const chosen: Record<string, unknown> = {
+		model: "cat-jam-free",
+		reasoning_effort: "high",
+	};
+	enforceOpencodeFingerprint(chosen, "/v1/chat/completions");
+	assert.equal(chosen.reasoning_effort, "high", "a supported effort is untouched");
+
+	const off: Record<string, unknown> = {
+		model: "cat-jam-free",
+		reasoning_effort: "off",
+	};
+	enforceOpencodeFingerprint(off, "/v1/chat/completions");
+	assert.equal(off.reasoning_effort, "off", "genuine off is never rewritten");
+
+	const unknown: Record<string, unknown> = {
+		model: "cat-jam-free",
+		reasoningEffort: "bogus",
+	};
+	enforceOpencodeFingerprint(unknown, "/v1/chat/completions");
+	assert.equal(unknown.reasoningEffort, "bogus", "unknown keys stay for upstream to rule on");
+
+	// The Zen messages lane carries no flat effort spelling and stays untouched.
+	const messagesLane: Record<string, unknown> = {
+		model: "cat-jam-free",
+		messages: [],
+		reasoning_effort: "bogus",
+	};
+	enforceOpencodeFingerprint(messagesLane, "/v1/messages");
+	assert.equal(messagesLane.reasoning_effort, "bogus", "messages lane keeps its caller value");
 });
 
 test("a replayed tool call with a malformed name is folded on the wire", () => {
