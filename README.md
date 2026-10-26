@@ -9,7 +9,7 @@ Nothing leaves your machine except the requests themselves to the free upstreams
 
 This is a standalone fork: it tracks the shared proxy core of
 [`trefeon/pi-freeflow`](https://github.com/trefeon/pi-freeflow) (synced to
-**v1.41.0** / `44078be`) and drops the Pi/OMP extension layer, so it runs on its
+**v1.42.1** / `ba02dd0`) and drops the Pi/OMP extension layer, so it runs on its
 own without a host.
 
 ## Requirements
@@ -171,12 +171,11 @@ export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 `GET /v1/models`. The tables below are generated from `src/models.ts`
 (`scripts/gen-readme.mjs`), so they stay accurate.
 
-### OpenCode Zen (12 models)
+### OpenCode Zen (10 models)
 
 | ID | Context | Max output | API | Thinking | Vision |
 |---|---|---|---|---|---|
-| `cat-jam-free` | 1M (1,048,576) | 128K (131,072) | chat | low,medium,high,xhigh,max | ❌ |
-| `mimo-v2.6-flash-free` | 1M (1,048,576) | 128K (131,072) | chat | minimal,low,medium,high,xhigh | ✅ |
+| `mimo-v2.6-flash-free` | 1M (1,048,576) | 128K (131,072) | chat | minimal,low,medium,high,xhigh | ❌ |
 | `nemotron-3-ultra-free` | 1M (1,000,000) | 182,520 | chat | minimal,low,medium,high,xhigh | ❌ |
 | `nemotron-3.5-lightning-free` | 1M (1,000,000) | 235,929 | chat | minimal,low,medium,high,xhigh | ❌ |
 | `nemotron-3.5-super-vl-free` | 1M (1,048,576) | 235,929 | chat | minimal,low,medium,high,xhigh | ✅ |
@@ -185,10 +184,9 @@ export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 | `glm-5.3-flash-free` | 1M (1,048,576) | 128K (131,072) | chat | low,high,max | ✅ |
 | `beam-free` | 1M (1,048,576) | 128K (131,072) | chat | low,medium,high,xhigh,max | ❌ |
 | `deepseek-v4.1-flash-free` | 1M (1,048,576) | 384K (393,216) | chat | low,high,max | ✅ |
-| `minimax-m3.1-flash-free` | 1M (1,000,000) | 512K (524,288) | chat | low,medium,high,xhigh,max | ✅ |
 | `flint-40b-free` | 256K (262,144) | 64K (65,536) | chat | low,medium,high,xhigh,max | ❌ |
 
-### KiloCode Gateway (16 models, keyless)
+### KiloCode Gateway (15 models, keyless)
 
 | ID | Context | Max output | API | Thinking | Vision |
 |---|---|---|---|---|---|
@@ -203,7 +201,6 @@ export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 | `kilo-auto/free` | 256K (256,000) | 10K (10,000) | chat | minimal,low,medium,high,xhigh | ❌ |
 | `openrouter/free` | 200K (200,000) | 64K (65,536) | chat | minimal,low,medium,high,xhigh | ✅ |
 | `stealth/glyph-cluster` | 256K (256,000) | 256K (256,000) | chat | minimal,low,medium,high,xhigh | ❌ |
-| `minimax/minimax-m3.1-flash:free` | 1M (1,000,000) | 512K (524,288) | chat | low,medium,high,xhigh,max | ✅ |
 | `nvidia/nemotron-3.5-super-vl:free` | 1M (1,000,000) | 128K (131,072) | chat | minimal,low,medium,high,xhigh | ✅ |
 | `reflection/beam-free` | 1M (1,048,576) | 128K (131,072) | chat | low,medium,high,xhigh,max | ❌ |
 | `recursive/flint-v1.0:free` | 256K (262,144) | 64K (65,536) | chat | minimal,low,medium,high,xhigh | ❌ |
@@ -213,7 +210,7 @@ export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 
 | ID | Context | Max output | API |
 |---|---|---|---|
-| `z-ai/glm-5.3-flash` | 1M (1,048,576) | 128K (131,072) | chat |
+| `cline/nemotron-3.5-super-vl` | 1M (1,000,000) | 128K (131,072) | chat |
 
 ### OVHcloud AI Endpoints (8 models, keyless direct)
 
@@ -230,7 +227,7 @@ export OPENAI_API_KEY="$(cat ~/.pi/agent/token)"
 
 ### Aliases
 
-`dots-3-note-preview` → `dots-studio/dots-3-note-preview:free`, `nemotron-3-nano-omni` → `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nemotron-3-ultra-550b` → `nvidia/nemotron-3-ultra-550b-a55b:free`, `nemotron-3.5-lightning` → `nvidia/nemotron-3.5-lightning:free`, `north-mini-code` → `cohere/north-mini-code:free`, `lfm-2.5` → `liquid/lfm-2.5-2.6b:free`, `glm-5.3-flash` → `glm-5.3-flash-free`, `glyph-cluster` → `stealth/glyph-cluster`, `mimo-v2.6-flash` → `mimo-v2.6-flash-free`, `nemotron-3.5-super-vl` → `nemotron-3.5-super-vl-free`, `longcat-2.5-preview` → `longcat-2.5-preview-free`, `longcat` → `longcat-2.5-preview-free`, `beam` → `beam-free`, `deepseek-v4.1-flash` → `deepseek-v4.1-flash-free`, `minimax-m3.1-flash` → `minimax-m3.1-flash-free`, `flint` → `flint-40b-free`, `flint-kilo` → `recursive/flint-v1.0:free`, `beam-kilo` → `reflection/beam-free`, `xing4.0` → `xingchen-agi/xing4.0-29b-a4b:free`, `laguna-s-2.1:free` → `poolside/laguna-s-2.1:free`, `laguna-xs-2.1:free` → `poolside/laguna-xs-2.1:free`, `kilo-auto` → `kilo-auto/free`, `openrouter` → `openrouter/free`, `gpt-oss-120b` → `ovh-free/gpt-oss-120b`, `gpt-oss-20b` → `ovh-free/gpt-oss-20b`, `qwen3.5-397b` → `ovh-free/Qwen3.5-397B-A17B`, `qwen3.5-9b` → `ovh-free/Qwen3.5-9B`, `qwen3.6-27b` → `ovh-free/Qwen3.6-27B`, `qwen3.8-27b` → `ovh-free/Qwen3.8-27B`, `mistral-small-3.2` → `ovh-free/Mistral-Small-3.2-24B-Instruct-2506`, `llama-3.3-70b` → `ovh-free/Meta-Llama-3_3-70B-Instruct`
+`dots-3-note-preview` → `dots-studio/dots-3-note-preview:free`, `nemotron-3-nano-omni` → `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`, `nemotron-3-ultra-550b` → `nvidia/nemotron-3-ultra-550b-a55b:free`, `nemotron-3.5-lightning` → `nvidia/nemotron-3.5-lightning:free`, `north-mini-code` → `cohere/north-mini-code:free`, `lfm-2.5` → `liquid/lfm-2.5-2.6b:free`, `glm-5.3-flash` → `glm-5.3-flash-free`, `glyph-cluster` → `stealth/glyph-cluster`, `mimo-v2.6-flash` → `mimo-v2.6-flash-free`, `nemotron-3.5-super-vl` → `nemotron-3.5-super-vl-free`, `longcat-2.5-preview` → `longcat-2.5-preview-free`, `longcat` → `longcat-2.5-preview-free`, `beam` → `beam-free`, `deepseek-v4.1-flash` → `deepseek-v4.1-flash-free`, `flint` → `flint-40b-free`, `flint-kilo` → `recursive/flint-v1.0:free`, `beam-kilo` → `reflection/beam-free`, `xing4.0` → `xingchen-agi/xing4.0-29b-a4b:free`, `laguna-s-2.1:free` → `poolside/laguna-s-2.1:free`, `laguna-xs-2.1:free` → `poolside/laguna-xs-2.1:free`, `kilo-auto` → `kilo-auto/free`, `openrouter` → `openrouter/free`, `gpt-oss-120b` → `ovh-free/gpt-oss-120b`, `gpt-oss-20b` → `ovh-free/gpt-oss-20b`, `qwen3.5-397b` → `ovh-free/Qwen3.5-397B-A17B`, `qwen3.5-9b` → `ovh-free/Qwen3.5-9B`, `qwen3.6-27b` → `ovh-free/Qwen3.6-27B`, `qwen3.8-27b` → `ovh-free/Qwen3.8-27B`, `mistral-small-3.2` → `ovh-free/Mistral-Small-3.2-24B-Instruct-2506`, `llama-3.3-70b` → `ovh-free/Meta-Llama-3_3-70B-Instruct`, `cline-super-vl` → `cline/nemotron-3.5-super-vl`
 
 ## What the proxy does
 

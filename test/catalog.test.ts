@@ -100,7 +100,7 @@ test("refreshCatalog passes an abortable timeout signal and falls back instead o
  * can hold as many entries as the static set while still missing this id.
  */
 const STATIC_IDS_ABSENT_FROM_LEGACY_CACHE = [
-	"z-ai/glm-5.3-flash",
+	"cline/nemotron-3.5-super-vl",
 ];
 
 /** Persist a catalog cache fixture; ageMs > TTL makes it stale (hidden from readCatalogCache). */
@@ -243,6 +243,15 @@ test("step-5-preview entries stay dead across both lanes (2026-10-16)", () => {
 	assert.equal(isFreeCatalogId("stepfun/step-5-preview-free"), false);
 	assert.equal(ALL_MODELS.some((m) => m.id === "step-5-preview-free"), false);
 	assert.equal(ALL_MODELS.some((m) => m.id === "stepfun/step-5-preview-free"), false);
+});
+
+test("both free MiniMax M3.1 Flash endpoints are dead (2026-10-23)", () => {
+	for (const id of ["minimax-m3.1-flash-free", "minimax/minimax-m3.1-flash:free"]) {
+		assert.equal(DEAD_MODEL_IDS.has(id), true, id + " must be dead-listed");
+		assert.equal(isFreeCatalogId(id), false, id + " must never enter the picker");
+		assert.equal(ALL_MODELS.some((m) => m.id === id), false, id + " must not be in the static catalog");
+	}
+	assert.equal(isFreeCatalogId("minimax-m3.1-flash"), false);
 });
 
 test("union-alpha is a dead model id (pruned, never re-enters)", () => {

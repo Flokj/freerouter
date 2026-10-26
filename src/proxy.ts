@@ -49,7 +49,7 @@ import {
 import { isDebugEnabled, log } from "./logger.ts";
 import { getModelUpstream, isClineModel, isOvhModel, KILO_MODEL_IDS, MODEL_MAP, ovhUpstreamModelId, resolveCanonicalModelId } from "./models.ts";
 import { ClineAuthError, refreshClineToken, toApiKey } from "./cline-device-auth.ts";
-import { rollChat } from "./cline-accounts.ts";
+import { rollChat, clineUpstreamModelId, keepClineTokensAlive, refreshClineVersion } from "./cline-accounts.ts";
 import { fetchWithSystemCA } from "./system-ca-fetch.ts";
 import {
 	buildFindGlobRestore,
@@ -251,6 +251,27 @@ async function clineRefreshImpl(refreshToken: string): Promise<{ token: string; 
  }
 }
 
+let clineKeepAliveTimer: NodeJS.Timeout | null = null;
+const CLINE_KEEP_ALIVE_INTERVAL_MS = 15 * 60 * 1000;
+
+export function startClineKeepAlive(): void {
+ if (clineKeepAliveTimer !== null) return;
+ void keepClineTokensAlive().catch(() => {});
+ void refreshClineVersion().catch(() => {});
+ clineKeepAliveTimer = setInterval(() => {
+  void keepClineTokensAlive().catch(() => {});
+  void refreshClineVersion().catch(() => {});
+ }, CLINE_KEEP_ALIVE_INTERVAL_MS);
+ clineKeepAliveTimer.unref?.();
+}
+
+export function stopClineKeepAlive(): void {
+ if (clineKeepAliveTimer !== null) {
+  clearInterval(clineKeepAliveTimer);
+  clineKeepAliveTimer = null;
+ }
+}
+
 /**
  * Bound on the caller tool names the audit summary carries (the recorder
  * applies the same caps itself; bounding here keeps a hostile body from
@@ -385,6 +406,7 @@ async function handleClineRequest(opts: {
   if (Array.isArray(chatBody.tools)) chatBody.tools = translateToolsForPath(chatBody.tools, "/v1/chat/completions");
   delete chatBody.prompt_cache_key;
  }
+ chatBody.model = clineUpstreamModelId(model);
  // Cline bypasses the fingerprint, but its arguments still malform the same
  // way: capture the caller's own schemas before translation for repair.
  const argSchemas = buildArgRepairSchemas(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
@@ -699,14 +721,25 @@ async function handleOvhRequest(opts: {
  // Lane quirks, keyed by canonical catalog id so an alias resolves to the same
  // model (the wire id above has already lost its `ovh-free/` prefix).
  const canonicalModelId = resolveCanonicalModelId(requestedModel);
- if (canonicalModelId === OVH_NO_EFFORT_MODEL) {
-  // Measured 2026-10-22: with `reasoning_effort` present this model answers
-  // HTTP 200 whose body is a bare `data: [DONE]` — no deltas, no error — at
-  // max_tokens 4000 and 32000 alike; without the field it streams its own
-  // reasoning plus a proper tool call. Every other OVH model tolerates the
-  // field, so the strip is this model only. The responses-path translation
-  // cannot reintroduce it: chatBodyFromResponsesBody copies a fixed scalar
-  // list that carries no reasoning/effort key.
+ // OVH's OpenAI-compatible surface rejects Qwen chat-template controls
+ // (`400 feature 'extra arguments: {"chat_template_kwargs":…}' is not
+ // currently supported`). The host classifies this loopback proxy as a local
+ // OpenAI-compatible backend, treats `Qwen3.x` models as template-dialect
+ // Qwen and injects them; the lane has no such feature. Strip defensively so
+ // no host version can leak them upstream.
+ delete chatBody.chat_template_kwargs;
+ delete chatBody.enable_thinking;
+delete chatBody.preserve_thinking;
+// OVH's OpenAI-compatible surface rejects Responses-native caps (`400 feature
+// 'extra arguments: {"max_output_tokens":…}' is not currently supported`)
+// when a responses-path request was translated via chatBodyFromResponsesBody.
+// Strip defensively so the cap is not passed as an unknown extra argument.
+delete chatBody.max_output_tokens;
+ const modelDef = MODEL_MAP.get(canonicalModelId) ?? MODEL_MAP.get(requestedModel);
+ if (canonicalModelId === OVH_NO_EFFORT_MODEL || (modelDef && !modelDef.reasoning)) {
+  // Qwen3.8-27B on OVH starves when reasoning_effort is present.
+  // Non-reasoning OVH models (Llama 3.3, Mistral Small) return HTTP 400
+  // "feature 'reasoning_effort for this model' is not currently supported".
   delete chatBody.reasoning_effort;
  }
  if (canonicalModelId === OVH_STRICT_TOOL_CALL_ID_MODEL) {
@@ -736,16 +769,38 @@ async function handleOvhRequest(opts: {
  res.once("close", abortOnClientGone);
  req.once("error", abortOnClientGone);
  let upstreamRes: Response;
+ let servedRelay: string | null = null;
  try {
-  // Keyless, direct (never the relay pool). OVH serves anonymous callers but
-  // rate-limits them, so a 429 here is a real per-IP cap and must NOT carry
-  // the relay-deploy hint — this lane can never ride a relay.
-  upstreamRes = await fetch(OVH_CHAT_URL, {
-   method: "POST",
-   headers: { "Content-Type": "application/json" },
-   body: JSON.stringify(chatBody),
-   signal: controller.signal,
-  });
+  const relayState = getActiveRelayState();
+  const relayPoolOn =
+   relayState.mode !== "off" &&
+   relayState.enabled !== false &&
+   Boolean(relayState.url || (relayState.relays && relayState.relays.length > 0));
+
+  if (relayPoolOn) {
+   upstreamRes = await relayFetch(
+    OVH_CHAT_URL,
+    {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+     body: JSON.stringify(chatBody),
+     signal: controller.signal,
+    },
+    reqId,
+    {
+     roundRobin: true,
+     onServed: (url) => { servedRelay = url; },
+    },
+    (failure) => audit?.attemptFailure({ attempt: failure.attempt, status: failure.status, reason: failure.reason }),
+   );
+  } else {
+   upstreamRes = await fetch(OVH_CHAT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(chatBody),
+    signal: controller.signal,
+   });
+  }
  } catch (e) {
   log("error", "ovh upstream fetch failed", { error: String(e), model: requestedModel }, reqId);
   if (!res.headersSent) {
@@ -793,17 +848,20 @@ async function handleOvhRequest(opts: {
    connection: "keep-alive",
    "x-accel-buffering": "no",
   });
-  // Fetched direct, never through the relay pool: attributing an OVH-side
-  // stream failure to an unrelated relay would mark a healthy relay failed.
+  // Fetched via relay pool or direct fallback.
   pipeUpstreamStream(
    Readable.fromWeb(upstreamRes.body as unknown as WebReadableStream),
    res,
    req,
    reqId,
-   "direct",
-   findGlob.renamedFindToGlob || findGlob.renamed !== undefined || argSchemas.size > 0
-    ? { callerHadTools: true, argSchemas, findGlob, pathname: "/v1/chat/completions" }
-    : undefined,
+   servedRelay ?? "direct",
+   {
+    callerHadTools: Array.isArray(parsedBody.tools) && parsedBody.tools.length > 0,
+    argSchemas,
+    findGlob,
+    pathname: "/v1/chat/completions",
+    normalizeReasoning: true,
+   },
    { upstreamContentType: upstreamRes.headers.get("content-type"), audit: audit?.active ? audit : undefined },
   );
   return;
@@ -1018,8 +1076,8 @@ export function isRelayEligibleModel(model: unknown): boolean {
  if (typeof model !== "string") return false;
  if (model.trim() === "") return true;
  const canonical = resolveCanonicalModelId(model.trim());
- if (isClineModel(canonical) || isOvhModel(canonical)) return false;
- return MODEL_MAP.has(canonical) || KILO_MODEL_IDS.has(canonical) || isFreeCatalogId(canonical);
+ if (isClineModel(canonical)) return false;
+ return MODEL_MAP.has(canonical) || KILO_MODEL_IDS.has(canonical) || isFreeCatalogId(canonical) || isOvhModel(canonical);
 }
 
 /**
@@ -1433,7 +1491,10 @@ export function handleControlRequest(
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify({ ok: true }));
   setTimeout(() => {
-   try { closeServer(); } catch { }
+   try {
+    stopClineKeepAlive();
+    closeServer();
+   } catch { }
    if (shutdownShouldExit) process.exit(0);
   }, 50);
   return true;
